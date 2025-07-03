@@ -1,0 +1,90 @@
+version: '3.8'
+
+services:
+  omada-sentiment-monitor:
+    build: .
+    container_name: omada-monitor
+    restart: unless-stopped
+    
+    environment:
+      # Reddit API 配置
+      - REDDIT_CLIENT_ID=${REDDIT_CLIENT_ID}
+      - REDDIT_CLIENT_SECRET=${REDDIT_CLIENT_SECRET}
+      - REDDIT_USER_AGENT=${REDDIT_USER_AGENT}
+      
+      # Azure Text Analytics 配置
+      - AZURE_TEXT_ANALYTICS_KEY=${AZURE_TEXT_ANALYTICS_KEY}
+      - AZURE_TEXT_ANALYTICS_ENDPOINT=${AZURE_TEXT_ANALYTICS_ENDPOINT}
+      
+      # Notion API 配置
+      - NOTION_TOKEN=${NOTION_TOKEN}
+      - NOTION_DATABASE_ID=${NOTION_DATABASE_ID}
+      
+      # SMTP 邮件配置
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_PORT=${SMTP_PORT}
+      - SMTP_USERNAME=${SMTP_USERNAME}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - SMTP_USE_TLS=${SMTP_USE_TLS}
+      - EMAIL_RECIPIENTS=${EMAIL_RECIPIENTS}
+      
+      # 系统配置
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - CHECK_INTERVAL=${CHECK_INTERVAL:-300}
+      - TARGET_SUBREDDITS=${TARGET_SUBREDDITS:-homenetworking,networking}
+      - PRIMARY_KEYWORDS=${PRIMARY_KEYWORDS:-omada,tp-link omada}
+      - ALERTS_ENABLED=${ALERTS_ENABLED:-true}
+      - DEBUG_MODE=${DEBUG_MODE:-false}
+      - TEST_MODE=${TEST_MODE:-false}
+      
+      # 容器配置
+      - TZ=Asia/Shanghai
+    
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+    
+    ports:
+      - "8080:8080"  # 为未来的 Web 界面预留
+    
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "python", "src/main.py", "--mode", "health"]
+      interval: 5m
+      timeout: 30s
+      retries: 3
+      start_period: 10s
+    
+    # 资源限制
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.1'
+
+  # Redis 缓存服务 (可选，用于高级功能)
+  redis:
+    image: redis:7-alpine
+    container_name: omada-redis
+    restart: unless-stopped
+    
+    volumes:
+      - redis_data:/data
+    
+    # 仅在需要时启用
+    profiles:
+      - redis
+    
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+
+volumes:
+  redis_data:
+    driver: local
+
+networks:
+  default:
+    name: omada-monitor-network 
