@@ -491,20 +491,10 @@ class RedditJsonCollector(LoggerMixin):
                 )
             author_factor = min(total_karma * 0.0001, 10)
 
-            # Subreddit weight
-            try:
-                from config.settings import SUBREDDIT_WEIGHTS
-                subreddit_weight = SUBREDDIT_WEIGHTS.get(
-                    post.get("subreddit", ""), 1.0
-                )
-            except Exception:
-                subreddit_weight = 1.0
-
             relevance_weight = post.get("relevance_score", 1.0)
 
             influence = (
                 (base_score + engagement + author_factor)
-                * subreddit_weight
                 * relevance_weight
             )
             return round(influence, 2)

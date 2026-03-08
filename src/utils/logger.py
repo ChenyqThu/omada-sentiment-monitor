@@ -128,30 +128,4 @@ class LoggerMixin:
         duration = (end_time - start_time).total_seconds()
         self.logger.info(f"{method_name} 执行完成，耗时: {duration:.2f}秒")
 
-# 默认日志器
-main_logger = get_logger('omada_monitor', 'logs/omada_monitor.log')
-reddit_logger = get_logger('reddit_collector', 'logs/reddit_collector.log')
-sentiment_logger = get_logger('sentiment_analyzer', 'logs/sentiment_analyzer.log')
-notion_logger = get_logger('notion_storage', 'logs/notion_storage.log')
-error_logger = get_logger('error', 'logs/error.log')
-
-def log_system_info():
-    """记录系统信息"""
-    main_logger.info("=== Omada 舆情监控系统启动 ===")
-    main_logger.info(f"日志级别: {system_config.log_level}")
-    main_logger.info(f"调试模式: {system_config.debug_mode}")
-    main_logger.info(f"测试模式: {system_config.test_mode}")
-    main_logger.info(f"数据保留天数: {system_config.data_retention_days}")
-
-def log_error(error: Exception, context: str = ""):
-    """记录错误信息"""
-    error_message = f"{context}: {str(error)}" if context else str(error)
-    error_logger.error(error_message, exc_info=True)
-
-def log_performance(operation: str, duration: float, **metrics):
-    """记录性能指标"""
-    metrics_str = ', '.join([f"{k}={v}" for k, v in metrics.items()])
-    performance_info = f"{operation} - 耗时: {duration:.2f}s"
-    if metrics_str:
-        performance_info += f", {metrics_str}"
-    main_logger.info(performance_info) 
+ 
