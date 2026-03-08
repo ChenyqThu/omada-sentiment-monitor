@@ -155,16 +155,37 @@ def show_stats():
         pct = f"({count/total*100:.1f}%)" if total > 0 else ""
         print(f"  {status}: {count} {pct}")
 
+    # Comments & authors
+    comment_count = db.conn.execute("SELECT COUNT(*) FROM comments").fetchone()[0]
+    author_count = db.conn.execute("SELECT COUNT(*) FROM authors").fetchone()[0]
+    notion_synced = db.conn.execute(
+        "SELECT COUNT(*) FROM posts WHERE notion_page_id IS NOT NULL"
+    ).fetchone()[0]
+    print(f"\n  评论: {comment_count}")
+    print(f"  KOL 作者: {author_count}")
+    print(f"  Notion 已同步: {notion_synced}")
+
+    # KOL tier breakdown
+    tiers = db.conn.execute(
+        "SELECT kol_tier, COUNT(*) as cnt FROM authors GROUP BY kol_tier ORDER BY cnt DESC"
+    ).fetchall()
+    if tiers:
+        tier_str = ", ".join(f"{r['kol_tier']}: {r['cnt']}" for r in tiers)
+        print(f"  KOL 等级分布: {tier_str}")
+
     # Recent pipeline runs
     rows = db.conn.execute(
-        "SELECT * FROM pipeline_runs ORDER BY id DESC LIMIT 5"
+        "SELECT * FROM pipeline_runs ORDER BY id DESC LIMIT 10"
     ).fetchall()
     if rows:
         print(f"\n📋 最近 Pipeline 运行记录:")
         for r in rows:
-            print(f"  [{r['stage']}] {r['started_at'][:19]} — "
+            errors = r["errors"] if r["errors"] else ""
+            err_tag = f" ⚠️{errors[:50]}" if errors and errors != "[]" else ""
+            print(f"  [{r['stage']:>13}] {r['started_at'][:19]} — "
                   f"处理: {r['posts_processed']}, 通过: {r['posts_passed']}"
-                  f"{' model=' + r['model_used'] if r['model_used'] else ''}")
+                  f"{' model=' + r['model_used'] if r['model_used'] else ''}"
+                  f"{err_tag}")
 
     db.close()
 

@@ -115,6 +115,31 @@ class NotionSyncClient(LoggerMixin):
     # Markdown API helpers
     # ------------------------------------------------------------------
 
+    def _notion_markdown_request(
+        self, method: str, url: str, headers: dict, json: dict = None, timeout: int = 30
+    ) -> http_requests.Response:
+        """Send a Notion Markdown API request with 429 retry."""
+        max_retries = 3
+        for attempt in range(max_retries):
+            if method == "GET":
+                resp = http_requests.get(url, headers=headers, timeout=timeout)
+            else:
+                resp = http_requests.patch(url, headers=headers, json=json, timeout=timeout)
+
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 2 * (attempt + 1)))
+                self.logger.warning(f"Notion 429 限流，{retry_after}s 后重试 ({attempt+1}/{max_retries})")
+                import time
+                time.sleep(retry_after)
+                continue
+
+            resp.raise_for_status()
+            return resp
+
+        # Last attempt failed with 429
+        resp.raise_for_status()
+        return resp
+
     def _write_page_markdown(self, page_id: str, markdown: str) -> bool:
         """通过 Notion Markdown API 写入页面内容 (insert_content)。
 
@@ -131,8 +156,7 @@ class NotionSyncClient(LoggerMixin):
             "insert_content": {"content": markdown},
         }
         try:
-            resp = http_requests.patch(url, headers=headers, json=payload, timeout=30)
-            resp.raise_for_status()
+            self._notion_markdown_request("PATCH", url, headers, json=payload)
             self.logger.debug(f"Markdown API 写入成功: page {page_id} ({len(markdown)} chars)")
             return True
         except http_requests.HTTPError as exc:
@@ -151,8 +175,7 @@ class NotionSyncClient(LoggerMixin):
             "Content-Type": "application/json",
         }
         try:
-            read_resp = http_requests.get(url, headers=headers, timeout=15)
-            read_resp.raise_for_status()
+            read_resp = self._notion_markdown_request("GET", url, headers, timeout=15)
             current = read_resp.json().get("markdown", "")
 
             if not current.strip():
@@ -172,8 +195,7 @@ class NotionSyncClient(LoggerMixin):
                     "allow_deleting_content": True,
                 },
             }
-            resp = http_requests.patch(url, headers=headers, json=payload, timeout=30)
-            resp.raise_for_status()
+            self._notion_markdown_request("PATCH", url, headers, json=payload)
             self.logger.debug(f"Markdown API 替换成功: page {page_id}")
             return True
         except http_requests.HTTPError as exc:
