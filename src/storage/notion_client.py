@@ -156,7 +156,13 @@ class NotionSyncClient(LoggerMixin):
             current = read_resp.json().get("markdown", "")
 
             if not current.strip():
-                return self._write_page_markdown(page_id, markdown)
+                # Try insert first; if it fails (e.g. page has empty blocks),
+                # fall through to replace with the raw current as content_range.
+                if self._write_page_markdown(page_id, markdown):
+                    return True
+                # Use whatever was returned (even whitespace) as content_range
+                if not current:
+                    return False
 
             payload = {
                 "type": "replace_content_range",
