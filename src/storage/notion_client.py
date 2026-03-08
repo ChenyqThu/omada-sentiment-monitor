@@ -1,11 +1,11 @@
 """
 Notion API 客户端
-负责将 Reddit 数据和 AI 分析结果同步到 Notion Database
-支持将帖子内容写入页面正文
+负责将 Pipeline 数据（帖子、KOL）同步到 Notion Database
 """
 import os
 import sys
 import json
+import requests as http_requests
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Union
 
@@ -16,8 +16,6 @@ if project_root not in sys.path:
 
 from config.settings import notion_config
 from src.utils.logger import LoggerMixin
-from src.collectors.reddit_collector import RedditPost, RedditComment
-from src.analyzers.base_analyzer import AnalysisResult
 
 try:
     from notion_client import Client
@@ -26,31 +24,36 @@ except ImportError:
     Client = None
     APIResponseError = Exception
 
+
 class NotionSyncClient(LoggerMixin):
     """Notion 同步客户端"""
-    
+
     def __init__(self):
         super().__init__()
-        
+
         if Client is None:
             raise ImportError("请安装 notion-client 库: pip install notion-client")
-        
+
         if not notion_config.token:
             raise ValueError("Notion Token 未配置，请设置 NOTION_TOKEN 环境变量")
-        
+
         if not notion_config.database_id:
             raise ValueError("Notion Database ID 未配置，请设置 NOTION_DATABASE_ID 环境变量")
-        
+
         # 初始化 Notion 客户端
         self.client = Client(auth=notion_config.token)
         self.database_id = notion_config.database_id
-        
+
         # 缓存 Database 结构
         self._database_schema = None
-        
+
         self.logger.info(f"Notion 客户端初始化完成")
         self.logger.info(f"Database ID: {self.database_id[:8]}...")
-    
+
+    # ------------------------------------------------------------------
+    # Schema & property helpers
+    # ------------------------------------------------------------------
+
     def _get_database_schema(self) -> Dict[str, Any]:
         """获取 Database 结构"""
         if self._database_schema is None:
@@ -61,915 +64,606 @@ class NotionSyncClient(LoggerMixin):
             except Exception as e:
                 self.logger.error(f"获取 Database 结构失败: {e}")
                 raise
-        
+
         return self._database_schema
-    
-    def _format_property_value(self, property_name: str, value: Any) -> Dict[str, Any]:
-        """格式化属性值为 Notion API 格式"""
+
+    def _format_property_value(self, property_name: str, value: Any) -> Optional[Dict[str, Any]]:
+        """根据 Database schema 自动格式化属性值"""
         schema = self._get_database_schema()
         prop_config = schema.get(property_name, {})
         prop_type = prop_config.get('type', 'rich_text')
-        
+
         if value is None:
             return None
-        
+
         try:
             if prop_type == 'title':
-                return {
-                    'title': [{'text': {'content': str(value)[:2000]}}]  # Notion 标题限制
-                }
+                return {'title': [{'text': {'content': str(value)[:2000]}}]}
             elif prop_type == 'rich_text':
-                return {
-                    'rich_text': [{'text': {'content': str(value)[:2000]}}]  # Notion 文本限制
-                }
+                return {'rich_text': [{'text': {'content': str(value)[:2000]}}]}
             elif prop_type == 'number':
-                return {
-                    'number': float(value) if value is not None else None
-                }
+                return {'number': float(value) if value is not None else None}
             elif prop_type == 'select':
-                return {
-                    'select': {'name': str(value)} if value else None
-                }
+                return {'select': {'name': str(value)} if value else None}
             elif prop_type == 'multi_select':
                 if isinstance(value, (list, tuple)):
-                    return {
-                        'multi_select': [{'name': str(v)} for v in value if v]
-                    }
+                    return {'multi_select': [{'name': str(v)} for v in value if v]}
                 elif isinstance(value, str):
-                    # 如果是逗号分隔的字符串
                     items = [item.strip() for item in value.split(',') if item.strip()]
-                    return {
-                        'multi_select': [{'name': item} for item in items]
-                    }
+                    return {'multi_select': [{'name': item} for item in items]}
                 else:
-                    return {
-                        'multi_select': [{'name': str(value)}] if value else []
-                    }
+                    return {'multi_select': [{'name': str(value)}] if value else []}
             elif prop_type == 'checkbox':
-                return {
-                    'checkbox': bool(value)
-                }
+                return {'checkbox': bool(value)}
             elif prop_type == 'date':
                 if isinstance(value, datetime):
-                    return {
-                        'date': {'start': value.isoformat()}
-                    }
+                    return {'date': {'start': value.isoformat()}}
                 elif isinstance(value, str):
-                    return {
-                        'date': {'start': value}
-                    }
+                    return {'date': {'start': value}}
                 else:
                     return None
             elif prop_type == 'url':
-                return {
-                    'url': str(value) if value else None
-                }
+                return {'url': str(value) if value else None}
             else:
-                # 默认当作文本处理
-                return {
-                    'rich_text': [{'text': {'content': str(value)[:2000]}}]
-                }
-        
+                return {'rich_text': [{'text': {'content': str(value)[:2000]}}]}
+
         except Exception as e:
             self.logger.warning(f"格式化属性 {property_name} 失败: {e}，使用默认格式")
-            return {
-                'rich_text': [{'text': {'content': str(value)[:2000]}}]
-            }
-    
-    def _create_page_properties(self, post: RedditPost, analysis: Optional[AnalysisResult] = None) -> Dict[str, Any]:
-        """创建页面属性"""
-        properties = {}
-        
-        # 基础信息
-        property_mappings = {
-            '标题': post.title,
-            '内容': post.content[:500] + '...' if len(post.content) > 500 else post.content,  # 属性中只存摘要
-            '类型': 'Post',
-            '来源': 'Reddit',
-            'Reddit ID': post.id,  # 添加 Reddit ID 用于唯一标识
-            'Subreddit': f'r/{post.subreddit}',
-            '作者': post.author,
-            '分数': post.score,
-            '评论数': post.num_comments,
-            '发布时间': post.created_time,
-            '采集时间': datetime.now(timezone.utc),
-            '最后更新时间': datetime.now(timezone.utc),  # 添加最后更新时间
-            'Reddit链接': post.url,
-            '影响力评分': post.influence_score,
-            '用户Karma': post.author_karma,
-            '相关性得分': post.relevance_score,
-            '匹配关键词': post.keywords_matched,
+            return {'rich_text': [{'text': {'content': str(value)[:2000]}}]}
+
+    # ------------------------------------------------------------------
+    # Markdown API helpers
+    # ------------------------------------------------------------------
+
+    def _write_page_markdown(self, page_id: str, markdown: str) -> bool:
+        """通过 Notion Markdown API 写入页面内容 (insert_content)。
+
+        Requires Notion-Version >= 2025-09-03.
+        """
+        url = f"https://api.notion.com/v1/pages/{page_id}/markdown"
+        headers = {
+            "Authorization": f"Bearer {notion_config.token}",
+            "Notion-Version": "2025-09-03",
+            "Content-Type": "application/json",
         }
-        
-        # 添加 AI 分析结果
-        if analysis and not analysis.error:
-            if analysis.sentiment:
-                sentiment_map = {'positive': '正面', 'negative': '负面', 'neutral': '中性'}
-                property_mappings.update({
-                    '情感倾向': sentiment_map.get(analysis.sentiment.sentiment, '中性'),
-                    '情感分数': analysis.sentiment.score,
-                    '置信度': analysis.sentiment.confidence,
-                })
-            
-            if analysis.key_phrases and analysis.key_phrases.phrases:
-                property_mappings['关键词'] = analysis.key_phrases.phrases[:10]  # 限制数量
-            
-            if analysis.topics and analysis.topics.topics:
-                property_mappings['主题分类'] = analysis.topics.topics
-            
-            if analysis.summary:
-                property_mappings['AI摘要'] = analysis.summary
-            
-            # 分析器类型
-            from config.settings import ai_analysis_config
-            property_mappings['分析器类型'] = ai_analysis_config.analyzer_type
-        
-        # 设置优先级
-        priority = '低'
-        if post.influence_score > 8:
-            priority = '高'
-        elif post.influence_score > 5:
-            priority = '中'
-        property_mappings['优先级'] = priority
-        
-        # 格式化所有属性
-        for prop_name, value in property_mappings.items():
-            formatted_value = self._format_property_value(prop_name, value)
-            if formatted_value is not None:
-                properties[prop_name] = formatted_value
-        
-        return properties
-    
-    def _create_page_content(self, post: RedditPost) -> List[Dict[str, Any]]:
-        """创建页面内容"""
+        payload = {
+            "type": "insert_content",
+            "insert_content": {"content": markdown},
+        }
         try:
-            blocks = []
-            
-            # 帖子信息部分
-            blocks.append({
-                "type": "heading_2",
-                "heading_2": {
-                    "rich_text": [{
-                        "type": "text",
-                        "text": {"content": "📋 帖子信息"}
-                    }]
-                }
-            })
-            
-            # 作者信息（如果有详细信息）
-            author_info_text = f"作者: {post.author}"
-            if hasattr(post, 'author_info') and post.author_info:
-                kol_score = post.author_kol_score
-                total_karma = post.author_info.get('total_karma', 0)
-                account_age = post.author_info.get('account_age_days', 0)
-                
-                # 添加 KOL 标识
-                kol_indicator = ""
-                if kol_score >= 70:
-                    kol_indicator = " 🌟 高影响力KOL"
-                elif kol_score >= 50:
-                    kol_indicator = " ⭐ 中等影响力KOL"
-                elif kol_score >= 30:
-                    kol_indicator = " 📈 潜在KOL"
-                
-                author_info_text = f"作者: {post.author}{kol_indicator} (KOL评分: {kol_score}, Karma: {total_karma:,}, 账户年龄: {account_age//365}年{account_age%365}天)"
-            
-            blocks.append({
-                "type": "paragraph",
-                "paragraph": {
-                    "rich_text": [{
-                        "type": "text",
-                        "text": {"content": author_info_text}
-                    }]
-                }
-            })
-            
-            blocks.append({
-                "type": "paragraph",
-                "paragraph": {
-                    "rich_text": [{
-                        "type": "text",
-                        "text": {"content": f"发布时间: {post.created_time.strftime('%Y-%m-%d %H:%M:%S')}"}
-                    }]
-                }
-            })
-            
-            blocks.append({
-                "type": "paragraph",
-                "paragraph": {
-                    "rich_text": [{
-                        "type": "text",
-                        "text": {"content": f"分数: {post.score} | 评论数: {post.num_comments} | 赞同率: {post.upvote_ratio:.1%}"}
-                    }]
-                }
-            })
-            
-            # 帖子内容部分
-            blocks.append({
-                "type": "heading_2",
-                "heading_2": {
-                    "rich_text": [{
-                        "type": "text",
-                        "text": {"content": "📝 帖子内容"}
-                    }]
-                }
-            })
-            
-            # 使用完整的帖子内容（selftext 优先）
-            full_content = post.selftext if post.selftext and post.selftext.strip() else post.content
-            
-            if full_content and full_content.strip():
-                content_chunks = self._split_text(full_content, 2000)
-                for chunk in content_chunks:
-                    blocks.append({
-                        "type": "paragraph",
-                        "paragraph": {
-                            "rich_text": [{
-                                "type": "text",
-                                "text": {"content": chunk.strip()}
-                            }]
-                        }
-                    })
-            else:
-                blocks.append({
-                    "type": "paragraph",
-                    "paragraph": {
-                        "rich_text": [{
-                            "type": "text",
-                            "text": {"content": "（仅标题帖子，无正文内容）"}
-                        }]
-                    }
-                })
-            
-            # 评论部分
-            if post.comments and len(post.comments) > 0:
-                blocks.append({
-                    "type": "heading_2",
-                    "heading_2": {
-                        "rich_text": [{
-                            "type": "text",
-                            "text": {"content": f"💬 评论 ({len(self._count_all_comments(post.comments))} 条)"}
-                        }]
-                    }
-                })
-                
-                # 递归添加嵌套评论
-                try:
-                    comment_blocks = self._create_comment_blocks(post.comments)
-                    blocks.extend(comment_blocks)
-                    
-                except Exception as comment_error:
-                    self.logger.error(f"处理评论时发生错误: {comment_error}")
-                    # 添加错误说明
-                    blocks.append({
-                        "type": "paragraph",
-                        "paragraph": {
-                            "rich_text": [{
-                                "type": "text",
-                                "text": {"content": "⚠️ 评论加载失败，请稍后重试"}
-                            }]
-                        }
-                    })
-            
-            # 验证所有块的结构
-            validated_blocks = []
-            for i, block in enumerate(blocks):
-                if self._validate_block_structure(block, i):
-                    validated_blocks.append(block)
-                else:
-                    self.logger.warning(f"块 {i} 验证失败，跳过: {block.get('type', 'unknown')}")
-            
-            self.logger.debug(f"创建了 {len(validated_blocks)} 个有效内容块")
-            return validated_blocks
-            
-        except Exception as e:
-            self.logger.error(f"创建页面内容失败: {e}")
-            return []
-    
-    def _count_all_comments(self, comments: List) -> int:
-        """递归计算所有评论数量（包括嵌套评论）"""
-        # 类型检查，防止传入错误的参数
-        if not comments:
-            return 0
-        
-        # 如果传入的是数字，直接返回
-        if isinstance(comments, (int, float)):
-            return int(comments)
-        
-        # 如果不是列表，尝试转换
-        if not isinstance(comments, (list, tuple)):
-            self.logger.warning(f"_count_all_comments 接收到非列表参数: {type(comments)}")
-            return 0
-        
-        total = 0
-        for comment in comments:
-            total += 1  # 当前评论
-            if hasattr(comment, 'replies') and comment.replies:
-                total += self._count_all_comments(comment.replies)
-        return total
-    
-    def _create_comment_blocks(self, comments: List, depth: int = 1) -> List[Dict[str, Any]]:
-        """递归创建评论块（支持嵌套显示）"""
-        blocks = []
-        
-        for i, comment in enumerate(comments):
-            try:
-                # 计算缩进（用空格表示层级）
-                indent = "　" * (depth - 1)  # 使用全角空格缩进
-                
-                # 作者信息
-                author_display = comment.author
-                if hasattr(comment, 'author_kol_score') and comment.author_kol_score > 0:
-                    kol_score = comment.author_kol_score
-                    if kol_score >= 70:
-                        author_display += " 🌟"
-                    elif kol_score >= 50:
-                        author_display += " ⭐"
-                    elif kol_score >= 30:
-                        author_display += " 📈"
-                    
-                    # 显示详细信息
-                    if hasattr(comment, 'author_info') and comment.author_info:
-                        karma = comment.author_info.get('total_karma', 0)
-                        tech_focus = comment.author_info.get('tech_focus_score', 0)
-                        author_display += f" (KOL: {kol_score}, Karma: {karma:,}"
-                        if tech_focus > 0.3:
-                            author_display += f", 技术专家: {tech_focus:.1%}"
-                        author_display += ")"
-                
-                # 评论标题
-                comment_title = f"{indent}💬 {author_display} (分数: {comment.score})"
-                
-                blocks.append({
-                    "type": "heading_3",
-                    "heading_3": {
-                        "rich_text": [{
-                            "type": "text",
-                            "text": {"content": comment_title},
-                            "annotations": {"bold": depth == 1}  # 只有第一层评论加粗
-                        }]
-                    }
-                })
-                
-                # 评论内容
-                content_chunks = self._split_text(comment.content, 2000)
-                for chunk in content_chunks:
-                    # 为嵌套评论添加缩进
-                    indented_content = f"{indent}{chunk.strip()}"
-                    
-                    blocks.append({
-                        "type": "paragraph",
-                        "paragraph": {
-                            "rich_text": [{
-                                "type": "text",
-                                "text": {"content": indented_content}
-                            }]
-                        }
-                    })
-                
-                # 递归处理子评论
-                if hasattr(comment, 'replies') and comment.replies and depth < 4:  # 限制最大深度
-                    reply_blocks = self._create_comment_blocks(comment.replies, depth + 1)
-                    blocks.extend(reply_blocks)
-                elif hasattr(comment, 'replies') and comment.replies and depth >= 4:
-                    # 超过最大深度时显示提示
-                    blocks.append({
-                        "type": "paragraph",
-                        "paragraph": {
-                            "rich_text": [{
-                                "type": "text",
-                                "text": {"content": f"{indent}　... 还有 {len(comment.replies)} 条深层回复"},
-                                "annotations": {"italic": True, "color": "gray"}
-                            }]
-                        }
-                    })
-                
-            except Exception as e:
-                self.logger.error(f"处理评论 {i} 时发生错误: {e}")
-                continue
-        
-        return blocks
-    
-    def _validate_block_structure(self, block: Dict[str, Any], index: int) -> bool:
-        """验证块结构是否正确"""
-        try:
-            # 检查基本结构
-            if not isinstance(block, dict):
-                self.logger.warning(f"块 {index} 不是字典类型")
-                return False
-            
-            # 检查必需字段
-            if 'type' not in block:
-                self.logger.warning(f"块 {index} 缺少 type 字段")
-                return False
-            
-            block_type = block['type']
-            
-            # 检查对应的内容字段是否存在
-            if block_type not in block:
-                self.logger.warning(f"块 {index} 类型为 {block_type}，但缺少对应的内容字段")
-                return False
-            
-            # 检查文本块的 rich_text 结构
-            if block_type in ['paragraph', 'heading_1', 'heading_2', 'heading_3']:
-                content = block[block_type]
-                if not isinstance(content, dict) or 'rich_text' not in content:
-                    self.logger.warning(f"块 {index} ({block_type}) 缺少 rich_text 字段")
-                    return False
-                
-                rich_text = content['rich_text']
-                if not isinstance(rich_text, list) or len(rich_text) == 0:
-                    self.logger.warning(f"块 {index} ({block_type}) rich_text 不是有效的列表")
-                    return False
-                
-                # 检查每个 rich_text 项目
-                for j, item in enumerate(rich_text):
-                    if not isinstance(item, dict) or 'text' not in item:
-                        self.logger.warning(f"块 {index} ({block_type}) rich_text[{j}] 缺少 text 字段")
-                        return False
-                    
-                    text_obj = item['text']
-                    if not isinstance(text_obj, dict) or 'content' not in text_obj:
-                        self.logger.warning(f"块 {index} ({block_type}) rich_text[{j}].text 缺少 content 字段")
-                        return False
-                    
-                    # 确保内容不为空
-                    content_text = text_obj['content']
-                    if not isinstance(content_text, str) or not content_text.strip():
-                        self.logger.warning(f"块 {index} ({block_type}) rich_text[{j}] 内容为空")
-                        return False
-            
+            resp = http_requests.patch(url, headers=headers, json=payload, timeout=30)
+            resp.raise_for_status()
+            self.logger.debug(f"Markdown API 写入成功: page {page_id} ({len(markdown)} chars)")
             return True
-            
-        except Exception as e:
-            self.logger.error(f"验证块 {index} 结构时出错: {e}")
+        except http_requests.HTTPError as exc:
+            self.logger.error(f"Markdown API 写入失败: {exc} — {exc.response.text if exc.response else ''}")
             return False
-    
-    def _split_text(self, text: str, max_length: int = 2000) -> List[str]:
-        """分割长文本"""
-        if len(text) <= max_length:
-            return [text]
-        
-        chunks = []
-        current_pos = 0
-        
-        while current_pos < len(text):
-            end_pos = current_pos + max_length
-            
-            if end_pos >= len(text):
-                chunks.append(text[current_pos:])
-                break
-            
-            # 尝试在单词边界分割
-            split_pos = text.rfind(' ', current_pos, end_pos)
-            if split_pos == -1 or split_pos <= current_pos:
-                split_pos = end_pos
-            
-            chunks.append(text[current_pos:split_pos])
-            current_pos = split_pos + 1 if split_pos < len(text) else split_pos
-        
-        return chunks
-    
-    def sync_post(self, post: RedditPost, analysis: Optional[AnalysisResult] = None) -> Optional[str]:
-        """同步单个帖子到 Notion"""
+        except Exception as exc:
+            self.logger.error(f"Markdown API 请求异常: {exc}")
+            return False
+
+    def _replace_page_markdown(self, page_id: str, markdown: str) -> bool:
+        """读取现有内容并整体替换 (replace_content_range)。"""
+        url = f"https://api.notion.com/v1/pages/{page_id}/markdown"
+        headers = {
+            "Authorization": f"Bearer {notion_config.token}",
+            "Notion-Version": "2025-09-03",
+            "Content-Type": "application/json",
+        }
         try:
-            # 检查是否已存在
-            existing_page = self._find_existing_page(post.id)
-            
-            if existing_page:
-                # 检查是否需要更新
-                update_info = self._should_update_post(existing_page, post)
-                
-                if update_info['should_update'] or update_info['should_update_content']:
-                    page_id = existing_page['id']
-                    if self.update_existing_page(page_id, post, update_info, analysis):
-                        self.logger.info(f"帖子 {post.id} 更新成功")
-                        return page_id
-                    else:
-                        self.logger.error(f"帖子 {post.id} 更新失败")
-                        return None
-                else:
-                    self.logger.debug(f"帖子 {post.id} 无需更新: {update_info['reason']}")
-                    return existing_page['id']
-            
-            # 如果不存在，创建新页面
-            # 创建页面属性
-            properties = self._create_page_properties(post, analysis)
-            
-            # 创建页面
-            response = self.client.pages.create(
-                parent={'database_id': self.database_id},
-                properties=properties
-            )
-            
-            page_id = response['id']
-            self.logger.info(f"创建页面成功: {page_id}")
-            
-            # 添加页面内容
-            try:
-                content_blocks = self._create_page_content(post)
-                if content_blocks:
-                    self.client.blocks.children.append(
-                        block_id=page_id,
-                        children=content_blocks
-                    )
-                    self.logger.debug(f"页面内容添加成功: {len(content_blocks)} 个块")
-            except Exception as e:
-                self.logger.warning(f"添加页面内容失败: {e}")
-            
-            return page_id
-            
-        except APIResponseError as e:
-            self.logger.error(f"Notion API 错误: {e}")
-            return None
-        except Exception as e:
-            self.logger.error(f"同步帖子失败: {e}")
-            return None
-    
+            read_resp = http_requests.get(url, headers=headers, timeout=15)
+            read_resp.raise_for_status()
+            current = read_resp.json().get("markdown", "")
+
+            if not current.strip():
+                return self._write_page_markdown(page_id, markdown)
+
+            payload = {
+                "type": "replace_content_range",
+                "replace_content_range": {
+                    "content": markdown,
+                    "content_range": current,
+                    "allow_deleting_content": True,
+                },
+            }
+            resp = http_requests.patch(url, headers=headers, json=payload, timeout=30)
+            resp.raise_for_status()
+            self.logger.debug(f"Markdown API 替换成功: page {page_id}")
+            return True
+        except http_requests.HTTPError as exc:
+            self.logger.error(f"Markdown API 替换失败: {exc} — {exc.response.text if exc.response else ''}")
+            return False
+        except Exception as exc:
+            self.logger.error(f"Markdown API 替换异常: {exc}")
+            return False
+
+    # ==================================================================
+    # Post Sync: sync post dicts (from SQLite) to Notion posts database
+    # ==================================================================
+
     def _find_existing_page(self, reddit_id: str) -> Optional[Dict[str, Any]]:
-        """查找是否已存在相同的帖子"""
+        """查找是否已存在相同 Reddit ID 的帖子"""
         try:
-            # 通过 Reddit ID 查找已存在的页面
             response = self.client.databases.query(
                 database_id=self.database_id,
                 filter={
                     "property": "Reddit ID",
-                    "rich_text": {
-                        "equals": reddit_id
-                    }
+                    "rich_text": {"equals": reddit_id},
                 },
-                page_size=1
+                page_size=1,
             )
-            
             results = response.get('results', [])
             if results:
                 self.logger.debug(f"找到已存在的帖子: {reddit_id}")
                 return results[0]
-            
             return None
-            
         except Exception as e:
             self.logger.warning(f"查找已存在页面失败: {e}")
             return None
-    
-    def sync_posts_batch(self, posts: List[RedditPost], analyses: Optional[List[AnalysisResult]] = None) -> Dict[str, Any]:
-        """批量同步帖子"""
-        results = {
-            'success_count': 0,
-            'failed_count': 0,
-            'updated_count': 0,  # 新增：更新计数
-            'created_count': 0,  # 新增：创建计数
-            'skipped_count': 0,  # 新增：跳过计数
-            'page_ids': [],
-            'errors': []
-        }
-        
-        analyses = analyses or [None] * len(posts)
-        
-        for i, post in enumerate(posts):
-            analysis = analyses[i] if i < len(analyses) else None
-            
-            try:
-                # 检查是否已存在
-                existing_page = self._find_existing_page(post.id)
-                
-                if existing_page:
-                    # 检查是否需要更新
-                    update_info = self._should_update_post(existing_page, post)
-                    
-                    if update_info['should_update'] or update_info['should_update_content']:
-                        page_id = existing_page['id']
-                        if self.update_existing_page(page_id, post, update_info, analysis):
-                            results['success_count'] += 1
-                            results['updated_count'] += 1
-                            results['page_ids'].append(page_id)
-                        else:
-                            results['failed_count'] += 1
-                    else:
-                        results['skipped_count'] += 1
-                        results['page_ids'].append(existing_page['id'])
-                else:
-                    # 创建新页面
-                    page_id = self._create_new_page(post, analysis)
-                    if page_id:
-                        results['success_count'] += 1
-                        results['created_count'] += 1
-                        results['page_ids'].append(page_id)
-                    else:
-                        results['failed_count'] += 1
-                        
-            except Exception as e:
-                results['failed_count'] += 1
-                results['errors'].append(f"帖子 {post.id}: {str(e)}")
-                self.logger.error(f"同步帖子 {post.id} 失败: {e}")
-        
-        self.logger.info(f"批量同步完成: 成功 {results['success_count']} (创建 {results['created_count']}, 更新 {results['updated_count']}, 跳过 {results['skipped_count']}), 失败 {results['failed_count']}")
-        return results
-    
-    def health_check(self) -> Dict[str, Any]:
-        """健康检查"""
+
+    def sync_post_from_dict(self, post: dict) -> Optional[str]:
+        """Sync a post dict (from SQLite with comments) to Notion.
+
+        Returns the Notion page ID on success, None on failure.
+        """
+        reddit_id = post.get("id", "")
+        if not reddit_id:
+            self.logger.error("Post dict missing 'id'")
+            return None
+
         try:
-            # 测试连接
-            response = self.client.databases.retrieve(database_id=self.database_id)
-            
-            return {
-                'status': 'healthy',
-                'database_title': response.get('title', [{}])[0].get('plain_text', 'Unknown'),
-                'database_id': self.database_id[:8] + '...',
-                'properties_count': len(response.get('properties', {}))
-            }
-            
-        except APIResponseError as e:
-            return {
-                'status': 'unhealthy',
-                'error': f"API错误: {e}",
-                'database_id': self.database_id[:8] + '...'
-            }
+            existing = self._find_existing_page(reddit_id)
+            properties = self._build_properties_from_dict(post)
+
+            if existing:
+                page_id = existing["id"]
+                self.client.pages.update(page_id=page_id, properties=properties)
+
+                # Check if comments changed — if so, replace page content
+                old_comments = self._get_page_comment_count(existing)
+                new_comments = len(post.get("comments", []))
+                if new_comments != old_comments:
+                    markdown = self._build_markdown_from_dict(post)
+                    if markdown:
+                        self._replace_page_markdown(page_id, markdown)
+                    self.logger.info(f"更新 Notion 页面 (含内容): {page_id}")
+                else:
+                    self.logger.info(f"更新 Notion 页面 (仅属性): {page_id}")
+            else:
+                response = self.client.pages.create(
+                    parent={"database_id": self.database_id},
+                    properties=properties,
+                )
+                page_id = response["id"]
+                self.logger.info(f"创建 Notion 页面: {page_id}")
+
+                markdown = self._build_markdown_from_dict(post)
+                if markdown:
+                    self._write_page_markdown(page_id, markdown)
+
+            return page_id
+
         except Exception as e:
-            return {
-                'status': 'unhealthy',
-                'error': str(e),
-                'database_id': self.database_id[:8] + '...'
-            }
-    
-    def get_sync_stats(self) -> Dict[str, Any]:
-        """获取同步统计"""
+            self.logger.error(f"sync_post_from_dict 失败 [{reddit_id}]: {e}")
+            return None
+
+    def _get_page_comment_count(self, page: dict) -> int:
+        """Extract comment count from an existing Notion page's properties."""
+        props = page.get("properties", {})
+        num_prop = props.get("评论数", {})
+        return num_prop.get("number", 0) or 0
+
+    def _build_properties_from_dict(self, post: dict) -> Dict[str, Any]:
+        """Build Notion properties from a SQLite post dict."""
+        from datetime import datetime as _dt, timezone as _tz
+
+        created = _dt.fromtimestamp(post.get("created_utc", 0), tz=_tz.utc)
+        now = _dt.now(_tz.utc)
+        week_str = now.strftime("%G-W%V")
+
+        sentiment_map = {
+            "positive": "正面", "negative": "负面",
+            "neutral": "中性", "mixed": "混合",
+        }
+        topic_map = {
+            "product_issue": "技术问题", "feature_request": "功能需求",
+            "deployment": "部署案例", "comparison": "竞品对比",
+            "recommendation_ask": "产品推荐", "firmware_update": "固件更新",
+            "general_discussion": "一般讨论", "competitor_intel": "竞品情报",
+            "positive_feedback": "正面反馈", "negative_feedback": "负面反馈",
+            "not_relevant": "低相关",
+        }
+
+        ai_sentiment = post.get("ai_sentiment_quick", "neutral")
+        ai_topic = post.get("ai_topic_category", "")
+        ai_relevance = post.get("ai_relevance_score", 0.0) or 0.0
+
+        sentiment_score_map = {
+            "positive": 0.6, "negative": -0.6,
+            "neutral": 0.0, "mixed": 0.0,
+        }
+
+        property_mappings = {
+            "标题": post.get("title", ""),
+            "内容": (post.get("selftext", "") or "")[:500],
+            "类型": "Post",
+            "来源": "Reddit",
+            "Reddit ID": post["id"],
+            "Subreddit": f'r/{post.get("subreddit", "")}',
+            "作者": post.get("author", "[deleted]"),
+            "分数": post.get("score", 0),
+            "评论数": post.get("num_comments", 0),
+            "发布时间": created,
+            "采集时间": now,
+            "最后更新时间": now,
+            "Reddit链接": f'https://www.reddit.com{post.get("permalink", "")}',
+            "相关性得分": ai_relevance,
+            "周报周期": week_str,
+            "情感倾向": sentiment_map.get(ai_sentiment, "中性"),
+            "情感分数_数值": sentiment_score_map.get(ai_sentiment, 0.0),
+            "AI摘要": post.get("ai_brief_reason", ""),
+        }
+
+        if ai_topic and ai_topic != "not_relevant":
+            cn_topic = topic_map.get(ai_topic, ai_topic)
+            property_mappings["主题分类"] = cn_topic
+
+        # Alert level
+        score_val = post.get("score", 0) or 0
+        comments_val = post.get("num_comments", 0) or 0
+        alert_level = "none"
+        if ai_sentiment == "negative" and (score_val > 20 or comments_val > 15):
+            alert_level = "critical"
+        elif ai_sentiment == "negative" and (score_val > 5 or comments_val > 5):
+            alert_level = "high"
+        elif ai_sentiment == "negative":
+            alert_level = "medium"
+        property_mappings["预警等级"] = alert_level
+
+        # Priority
+        priority = "低"
+        if ai_relevance >= 0.8 and (score_val > 10 or comments_val > 10):
+            priority = "高"
+        elif ai_relevance >= 0.5:
+            priority = "中"
+        property_mappings["优先级"] = priority
+
+        properties = {}
+        for prop_name, value in property_mappings.items():
+            formatted = self._format_property_value(prop_name, value)
+            if formatted is not None:
+                properties[prop_name] = formatted
+
+        return properties
+
+    def _build_markdown_from_dict(self, post: dict) -> str:
+        """Build markdown content from a SQLite post dict with comments."""
+        lines = []
+
+        lines.append("## 📋 帖子信息")
+        lines.append("")
+        lines.append(f"作者: u/{post.get('author', '[deleted]')}")
+        lines.append("")
+
+        created_utc = post.get("created_utc", 0)
+        if created_utc:
+            from datetime import datetime as _dt, timezone as _tz
+            created = _dt.fromtimestamp(created_utc, tz=_tz.utc)
+            lines.append(f"发布时间: {created.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        lines.append("")
+
+        score = post.get("score", 0)
+        num_comments = post.get("num_comments", 0)
+        upvote_ratio = post.get("upvote_ratio", 0)
+        lines.append(f"分数: {score} | 评论数: {num_comments} | 赞同率: {upvote_ratio:.0%}")
+        lines.append("")
+
+        ai_reason = post.get("ai_brief_reason", "")
+        ai_topic = post.get("ai_topic_category", "")
+        ai_sentiment = post.get("ai_sentiment_quick", "")
+        ai_relevance = post.get("ai_relevance_score", 0)
+        if ai_reason:
+            lines.append(f"**AI 初筛**: {ai_reason} (相关性: {ai_relevance:.2f}, 话题: {ai_topic}, 情感: {ai_sentiment})")
+            lines.append("")
+
+        lines.append("## 📝 帖子内容")
+        lines.append("")
+        selftext = post.get("selftext", "") or ""
+        if selftext.strip():
+            lines.append(selftext.strip())
+        else:
+            lines.append("（仅标题帖子，无正文内容）")
+        lines.append("")
+
+        comments = post.get("comments", [])
+        if comments:
+            lines.append(f"## 💬 评论 ({len(comments)} 条)")
+            lines.append("")
+            self._build_flat_comments_markdown(comments, lines)
+
+        return "\n".join(lines)
+
+    def _build_flat_comments_markdown(self, comments: list, lines: list) -> None:
+        """Build markdown from flat comment list using Notion enhanced markdown.
+
+        Uses <details> (toggle) for each comment to keep the page clean.
+        Depth is indicated by tab indentation inside parent toggles.
+        """
+        for c in comments:
+            depth = c.get("depth", 0)
+            indent = "\t" * depth
+
+            author = c.get("author", "[deleted]")
+            score = c.get("score", 0)
+            body = (c.get("body", "") or "").strip()
+
+            lines.append(f"{indent}<details>")
+            lines.append(f"{indent}<summary>💬 u/{author} (分数: {score})</summary>")
+            lines.append(f"")
+            if body:
+                for bline in body.split("\n"):
+                    lines.append(f"{indent}\t{bline}")
+            else:
+                lines.append(f"{indent}\t（空评论）")
+            lines.append(f"")
+            lines.append(f"{indent}</details>")
+            lines.append("")
+
+    # ==================================================================
+    # KOL Sync: sync author dicts to Notion KOL database
+    # ==================================================================
+
+    def sync_kol_from_dict(self, author: dict, posts: list[dict] = None) -> Optional[str]:
+        """Sync an author/KOL dict (from SQLite) to Notion KOL database.
+
+        Returns the Notion page ID on success, None on failure.
+        """
+        if not notion_config.kol_database_id:
+            self.logger.warning("NOTION_KOL_DATABASE_ID 未配置，跳过 KOL 同步")
+            return None
+
+        username = author.get("username", "")
+        if not username:
+            self.logger.error("Author dict missing 'username'")
+            return None
+
+        try:
+            existing = self._find_kol_page(username)
+            properties = self._build_kol_properties(author, posts)
+            new_post_count = len(posts) if posts else 0
+
+            if existing:
+                page_id = existing["id"]
+                self.client.pages.update(page_id=page_id, properties=properties)
+
+                # Check if post list changed — if so, replace page content
+                old_post_count = self._get_kol_post_count(existing)
+                if new_post_count != old_post_count:
+                    markdown = self._build_kol_markdown(author, posts)
+                    if markdown:
+                        self._replace_page_markdown(page_id, markdown)
+                    self.logger.info(f"更新 KOL 页面 (含内容): {username} → {page_id}")
+                else:
+                    self.logger.info(f"更新 KOL 页面 (仅属性): {username} → {page_id}")
+            else:
+                response = self.client.pages.create(
+                    parent={"database_id": notion_config.kol_database_id},
+                    properties=properties,
+                )
+                page_id = response["id"]
+                self.logger.info(f"创建 KOL 页面: {username} → {page_id}")
+
+                markdown = self._build_kol_markdown(author, posts)
+                if markdown:
+                    self._write_page_markdown(page_id, markdown)
+
+            return page_id
+
+        except Exception as e:
+            self.logger.error(f"sync_kol_from_dict 失败 [{username}]: {e}")
+            return None
+
+    def _get_kol_post_count(self, page: dict) -> int:
+        """Extract post count from KOL page's 备注 field (heuristic)."""
+        props = page.get("properties", {})
+        notes = props.get("备注", {})
+        rich_text = notes.get("rich_text", [])
+        if rich_text:
+            text = rich_text[0].get("plain_text", "")
+            # Parse "本地帖子: N" from notes
+            import re
+            m = re.search(r"本地帖子:\s*(\d+)", text)
+            if m:
+                return int(m.group(1))
+        return 0
+
+    def _find_kol_page(self, username: str) -> Optional[Dict[str, Any]]:
+        """Find existing KOL page by username (title column: KOL 名称)."""
         try:
             response = self.client.databases.query(
-                database_id=self.database_id,
-                page_size=1
+                database_id=notion_config.kol_database_id,
+                filter={
+                    "property": "KOL 名称",
+                    "title": {"equals": username},
+                },
+                page_size=1,
             )
-            
-            total_count = response.get('total', 0) if 'total' in response else '未知'
-            
-            return {
-                'total_pages': total_count,
-                'database_id': self.database_id[:8] + '...',
-                'last_sync': datetime.now().isoformat()
-            }
-            
+            results = response.get("results", [])
+            return results[0] if results else None
         except Exception as e:
-            self.logger.error(f"获取同步统计失败: {e}")
-            return {
-                'error': str(e),
-                'database_id': self.database_id[:8] + '...'
+            self.logger.warning(f"查找 KOL 页面失败 [{username}]: {e}")
+            return None
+
+    def _build_kol_properties(self, author: dict, posts: list[dict] = None) -> Dict[str, Any]:
+        """Build Notion properties for a KOL page.
+
+        KOL DB schema:
+          KOL 名称 (title), Comment Karma (number), Post Karma (number),
+          Cake Day (date), 粉丝数量 (number), 主页 (email), Subreddit (multi_select),
+          平台 (multi_select), 领域 (multi_select), 互动率 (number),
+          Achivements (multi_select), 备注 (rich_text), 合作状态 (status),
+          预算范围 (select), 最近合作日期 (date)
+        """
+        from datetime import datetime as _dt, timezone as _tz
+        from collections import Counter
+
+        username = author.get("username", "")
+        link_karma = author.get("link_karma", 0)
+        comment_karma = author.get("comment_karma", 0)
+        total_karma = author.get("total_karma", 0)
+        created_utc = author.get("created_utc", 0)
+        kol_score = author.get("kol_score", 0)
+        kol_tier = author.get("kol_tier", "watch")
+        post_count = author.get("post_count", 0)
+        avg_post_score = author.get("avg_post_score", 0)
+
+        tier_cn = {
+            "expert": "专家", "insider": "内行",
+            "active": "活跃", "watch": "观察",
+        }
+
+        # Extract subreddit info from posts
+        subreddit_counts = Counter()
+        if posts:
+            for p in posts:
+                sub = p.get("subreddit", "")
+                if sub:
+                    subreddit_counts[sub] += 1
+
+        # Map subreddits to domain tags
+        domain_map = {
+            "homenetworking": "家庭网络",
+            "networking": "企业网络",
+            "Ubiquiti": "网络设备",
+            "TPLink_Omada": "Omada",
+            "TplinkOmada": "Omada",
+            "Omada_Networks": "Omada",
+            "msp": "IT服务商",
+        }
+        domains = []
+        for sub in subreddit_counts:
+            tag = domain_map.get(sub)
+            if tag and tag not in [d["name"] for d in domains]:
+                domains.append({"name": tag})
+
+        properties = {
+            "KOL 名称": {
+                "title": [{"text": {"content": username}}]
+            },
+            "Comment Karma": {"number": comment_karma},
+            "Post Karma": {"number": link_karma},
+            "粉丝数量": {"number": total_karma},
+            "互动率": {"number": round(kol_score, 2)},
+            "平台": {
+                "multi_select": [{"name": "Reddit"}]
+            },
+            "主页": {"email": f"https://reddit.com/user/{username}"},
+            "备注": {
+                "rich_text": [{
+                    "text": {
+                        "content": (
+                            f"KOL等级: {tier_cn.get(kol_tier, kol_tier)} "
+                            f"(评分: {kol_score:.1f}/60) | "
+                            f"本地帖子: {post_count} | "
+                            f"平均分: {avg_post_score:.1f}"
+                        )[:2000]
+                    }
+                }]
+            },
+        }
+
+        # Subreddit (multi_select)
+        if subreddit_counts:
+            properties["Subreddit"] = {
+                "multi_select": [{"name": sub} for sub in subreddit_counts]
             }
-    
-    def _should_update_post(self, existing_page: Dict[str, Any], new_post: RedditPost) -> Dict[str, Any]:
-        """判断帖子是否需要更新，返回详细的更新信息"""
-        try:
-            # 如果禁用了更新功能，直接返回不更新
-            if not notion_config.enable_update:
-                return {
-                    'should_update': False,
-                    'should_update_content': False,
-                    'reason': '更新功能已禁用'
-                }
-                
-            properties = existing_page.get('properties', {})
-            
-            # 获取现有的分数和评论数
-            old_score_prop = properties.get('分数', {})
-            old_comments_prop = properties.get('评论数', {})
-            
-            old_score = 0
-            old_comments = 0
-            
-            if old_score_prop.get('type') == 'number' and old_score_prop.get('number') is not None:
-                old_score = old_score_prop['number']
-            
-            if old_comments_prop.get('type') == 'number' and old_comments_prop.get('number') is not None:
-                old_comments = old_comments_prop['number']
-            
-            # 计算变化幅度
-            score_change = new_post.score - old_score
-            comments_change = new_post.num_comments - old_comments
-            
-            # 计算相对变化百分比
-            score_change_percent = 0
-            if old_score > 0:
-                score_change_percent = abs(score_change) / old_score * 100
-            elif new_post.score > 0:  # 从0分变为有分数
-                score_change_percent = 100
-            
-            comments_change_percent = 0
-            if old_comments > 0:
-                comments_change_percent = abs(comments_change) / old_comments * 100
-            elif new_post.num_comments > 0:  # 从0评论变为有评论
-                comments_change_percent = 100
-            
-            # 判断是否需要更新属性
-            should_update_properties = (
-                # 1. 分数变化超过配置的百分比阈值且绝对变化大于最小值
-                (score_change_percent > notion_config.score_change_threshold and 
-                 abs(score_change) > notion_config.score_change_min) or
-                # 2. 评论数变化超过配置的百分比阈值且绝对变化大于最小值
-                (comments_change_percent > notion_config.comments_change_threshold and 
-                 abs(comments_change) > notion_config.comments_change_min) or
-                # 3. 热门帖子（分数超过阈值）且分数变化大于最小值
-                (new_post.score > notion_config.hot_post_score_threshold and 
-                 score_change > notion_config.hot_post_score_change_min) or
-                # 4. 热议帖子（评论数超过阈值）且评论数变化大于最小值
-                (new_post.num_comments > notion_config.popular_post_comments_threshold and 
-                 comments_change > notion_config.popular_post_comments_change_min)
-            )
-            
-            # 判断是否需要更新内容（主要基于评论数变化或有新评论）
-            should_update_content = (
-                # 评论数有显著增加
-                comments_change > 0 and (
-                    comments_change_percent > notion_config.comments_change_threshold or
-                    comments_change >= notion_config.comments_change_min
-                ) and
-                # 新帖子有评论内容
-                new_post.comments and len(new_post.comments) > 0
-            )
-            
-            # 构建更新原因
-            reasons = []
-            if score_change_percent > notion_config.score_change_threshold and abs(score_change) > notion_config.score_change_min:
-                reasons.append(f"分数变化 {score_change_percent:.1f}%")
-            if comments_change_percent > notion_config.comments_change_threshold and abs(comments_change) > notion_config.comments_change_min:
-                reasons.append(f"评论数变化 {comments_change_percent:.1f}%")
-            if new_post.score > notion_config.hot_post_score_threshold and score_change > notion_config.hot_post_score_change_min:
-                reasons.append("热门帖子分数增长")
-            if new_post.num_comments > notion_config.popular_post_comments_threshold and comments_change > notion_config.popular_post_comments_change_min:
-                reasons.append("热议帖子评论增长")
-            if should_update_content:
-                reasons.append("评论内容需要更新")
-            
-            result = {
-                'should_update': should_update_properties,
-                'should_update_content': should_update_content,
-                'old_score': old_score,
-                'new_score': new_post.score,
-                'score_change': score_change,
-                'score_change_percent': score_change_percent,
-                'old_comments': old_comments,
-                'new_comments': new_post.num_comments,
-                'comments_change': comments_change,
-                'comments_change_percent': comments_change_percent,
-                'reason': '; '.join(reasons) if reasons else '无需更新'
-            }
-            
-            if should_update_properties or should_update_content:
-                self.logger.info(f"帖子 {new_post.id} 需要更新: "
-                               f"分数 {old_score} -> {new_post.score} (+{score_change}, {score_change_percent:.1f}%), "
-                               f"评论 {old_comments} -> {new_post.num_comments} (+{comments_change}, {comments_change_percent:.1f}%)")
-                if should_update_content:
-                    self.logger.info(f"帖子 {new_post.id} 需要更新页面内容（评论数变化）")
-            
-            return result
-            
-        except Exception as e:
-            self.logger.error(f"检查帖子更新需求失败: {e}")
-            return {
-                'should_update': False,
-                'should_update_content': False,
-                'reason': f'检查失败: {str(e)}'
-            }
-    
-    def update_existing_page(self, page_id: str, post: RedditPost, update_info: Dict[str, Any], analysis: Optional[AnalysisResult] = None) -> bool:
-        """更新已存在的页面"""
-        try:
-            update_success = True
-            
-            # 1. 更新页面属性（如果需要）
-            if update_info.get('should_update', False):
-                # 创建更新的属性（只更新需要更新的字段）
-                update_properties = {
-                    '分数': self._format_property_value('分数', post.score),
-                    '评论数': self._format_property_value('评论数', post.num_comments),
-                    '影响力评分': self._format_property_value('影响力评分', post.influence_score),
-                    '最后更新时间': self._format_property_value('最后更新时间', datetime.now(timezone.utc)),
-                    '相关性得分': self._format_property_value('相关性得分', post.relevance_score),
-                }
-                
-                # 如果有新的 AI 分析结果，也更新它们
-                if analysis and not analysis.error:
-                    if analysis.sentiment:
-                        sentiment_map = {'positive': '正面', 'negative': '负面', 'neutral': '中性'}
-                        update_properties.update({
-                            '情感倾向': self._format_property_value('情感倾向', sentiment_map.get(analysis.sentiment.sentiment, '中性')),
-                            '情感分数': self._format_property_value('情感分数', analysis.sentiment.score),
-                            '置信度': self._format_property_value('置信度', analysis.sentiment.confidence),
-                        })
-                    
-                    if analysis.key_phrases and analysis.key_phrases.phrases:
-                        update_properties['关键词'] = self._format_property_value('关键词', analysis.key_phrases.phrases[:10])
-                    
-                    if analysis.topics and analysis.topics.topics:
-                        update_properties['主题分类'] = self._format_property_value('主题分类', analysis.topics.topics)
-                    
-                    if analysis.summary:
-                        update_properties['AI摘要'] = self._format_property_value('AI摘要', analysis.summary)
-                
-                # 重新计算优先级
-                priority = '低'
-                if post.influence_score > 8:
-                    priority = '高'
-                elif post.influence_score > 5:
-                    priority = '中'
-                update_properties['优先级'] = self._format_property_value('优先级', priority)
-                
-                # 过滤掉空值
-                filtered_properties = {k: v for k, v in update_properties.items() if v is not None}
-                
-                # 更新页面属性
-                self.client.pages.update(
-                    page_id=page_id,
-                    properties=filtered_properties
-                )
-                
-                self.logger.info(f"页面属性更新成功: {page_id}")
-            
-            # 2. 更新页面内容（如果需要）
-            if update_info.get('should_update_content', False):
-                content_update_success = self._replace_page_content(page_id, post)
-                if content_update_success:
-                    self.logger.info(f"页面内容更新成功: {page_id} (评论数: {post.num_comments})")
+
+        # 领域 (multi_select)
+        if domains:
+            properties["领域"] = {"multi_select": domains}
+
+        # Cake Day
+        if created_utc:
+            cake_day = _dt.fromtimestamp(created_utc, tz=_tz.utc)
+            properties["Cake Day"] = {"date": {"start": cake_day.strftime("%Y-%m-%d")}}
+
+        # Achievements
+        achievements = []
+        if author.get("is_gold"):
+            achievements.append({"name": "Reddit Gold"})
+        if author.get("is_mod"):
+            achievements.append({"name": "Moderator"})
+        if author.get("has_verified_email"):
+            achievements.append({"name": "Verified Email"})
+        if kol_tier == "expert":
+            achievements.append({"name": "Expert"})
+        elif kol_tier == "insider":
+            achievements.append({"name": "Insider"})
+        if achievements:
+            properties["Achivements"] = {"multi_select": achievements}
+
+        return properties
+
+    def _build_kol_markdown(self, author: dict, posts: list[dict] = None) -> str:
+        """Build markdown content for a KOL page."""
+        lines = []
+        username = author.get("username", "")
+
+        lines.append("## 👤 用户概况")
+        lines.append("")
+        lines.append(f"**Reddit**: [u/{username}](https://www.reddit.com/user/{username})")
+        lines.append("")
+
+        total_karma = author.get("total_karma", 0)
+        link_karma = author.get("link_karma", 0)
+        comment_karma = author.get("comment_karma", 0)
+        age_days = author.get("account_age_days", 0)
+        age_years = age_days / 365 if age_days else 0
+
+        lines.append(f"| 指标 | 值 |")
+        lines.append(f"|---|---|")
+        lines.append(f"| 总 Karma | {total_karma:,} |")
+        lines.append(f"| 发帖 Karma | {link_karma:,} |")
+        lines.append(f"| 评论 Karma | {comment_karma:,} |")
+        lines.append(f"| 账号年龄 | {age_years:.1f} 年 ({age_days} 天) |")
+
+        badges = []
+        if author.get("is_gold"):
+            badges.append("Reddit Gold")
+        if author.get("is_mod"):
+            badges.append("版主")
+        if author.get("has_verified_email"):
+            badges.append("邮箱已验证")
+        if badges:
+            lines.append(f"| 标签 | {', '.join(badges)} |")
+        lines.append("")
+
+        kol_score = author.get("kol_score", 0)
+        kol_tier = author.get("kol_tier", "watch")
+        tier_cn = {"expert": "专家", "insider": "内行", "active": "活跃", "watch": "观察"}
+        lines.append("## 📊 KOL 评估")
+        lines.append("")
+        lines.append(f"**评分**: {kol_score:.1f} / 60  |  **等级**: {tier_cn.get(kol_tier, kol_tier)}")
+        lines.append("")
+
+        if posts:
+            lines.append(f"## 📝 相关帖子 ({len(posts)} 篇)")
+            lines.append("")
+            for p in posts[:20]:
+                title = p.get("title", "")
+                score = p.get("score", 0)
+                comments = p.get("num_comments", 0)
+                subreddit = p.get("subreddit", "")
+                permalink = p.get("permalink", "")
+                ai_topic = p.get("ai_topic_category", "")
+
+                link = f"https://www.reddit.com{permalink}" if permalink else ""
+                topic_tag = f" [{ai_topic}]" if ai_topic and ai_topic != "not_relevant" else ""
+
+                if link:
+                    lines.append(f"- [{title}]({link}) — r/{subreddit} | ⬆️{score} 💬{comments}{topic_tag}")
                 else:
-                    self.logger.error(f"页面内容更新失败: {page_id}")
-                    update_success = False
-            
-            return update_success
-            
-        except APIResponseError as e:
-            self.logger.error(f"Notion API 更新错误: {e}")
-            return False
-        except Exception as e:
-            self.logger.error(f"更新页面失败: {e}")
-            return False
-    
-    def _create_new_page(self, post: RedditPost, analysis: Optional[AnalysisResult] = None) -> Optional[str]:
-        """创建新页面"""
-        try:
-            # 创建页面属性
-            properties = self._create_page_properties(post, analysis)
-            
-            # 创建页面
-            response = self.client.pages.create(
-                parent={'database_id': self.database_id},
-                properties=properties
-            )
-            
-            page_id = response['id']
-            self.logger.info(f"创建页面成功: {page_id}")
-            
-            # 添加页面内容
-            try:
-                content_blocks = self._create_page_content(post)
-                if content_blocks:
-                    self.client.blocks.children.append(
-                        block_id=page_id,
-                        children=content_blocks
-                    )
-                    self.logger.debug(f"页面内容添加成功: {len(content_blocks)} 个块")
-            except Exception as e:
-                self.logger.warning(f"添加页面内容失败: {e}")
-            
-            return page_id
-            
-        except APIResponseError as e:
-            self.logger.error(f"Notion API 错误: {e}")
-            return None
-        except Exception as e:
-            self.logger.error(f"创建页面失败: {e}")
-            return None
-    
-    def _replace_page_content(self, page_id: str, post: RedditPost) -> bool:
-        """替换页面的所有内容（删除原有内容，重新写入）"""
-        try:
-            # 1. 获取页面的所有子块
-            self.logger.debug(f"开始替换页面 {page_id} 的内容")
-            
-            # 获取现有的块
-            response = self.client.blocks.children.list(block_id=page_id)
-            existing_blocks = response.get('results', [])
-            
-            # 2. 删除所有现有的块
-            if existing_blocks:
-                self.logger.debug(f"删除 {len(existing_blocks)} 个现有内容块")
-                for block in existing_blocks:
-                    try:
-                        self.client.blocks.delete(block_id=block['id'])
-                    except Exception as e:
-                        self.logger.warning(f"删除块 {block['id']} 失败: {e}")
-            
-            # 3. 添加新的内容
-            new_content_blocks = self._create_page_content(post)
-            if new_content_blocks:
-                self.client.blocks.children.append(
-                    block_id=page_id,
-                    children=new_content_blocks
-                )
-                self.logger.debug(f"成功添加 {len(new_content_blocks)} 个新内容块")
-            
-            return True
-            
-        except APIResponseError as e:
-            self.logger.error(f"Notion API 错误，替换页面内容失败: {e}")
-            return False
-        except Exception as e:
-            self.logger.error(f"替换页面内容失败: {e}")
-            return False 
+                    lines.append(f"- {title} — r/{subreddit} | ⬆️{score} 💬{comments}{topic_tag}")
+            lines.append("")
+
+        return "\n".join(lines)

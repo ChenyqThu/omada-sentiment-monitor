@@ -149,7 +149,9 @@ class NotionConfig:
     hot_post_score_change_min: int = 10  # 热门帖子分数变化最小值
     popular_post_comments_threshold: int = 50  # 热议帖子评论数阈值
     popular_post_comments_change_min: int = 5  # 热议帖子评论数变化最小值
-    
+    report_parent_page_id: str = ''
+    kol_database_id: str = ''
+
     def __post_init__(self):
         self.token = get_env_var('NOTION_TOKEN', required=True)
         self.database_id = get_env_var('NOTION_DATABASE_ID', required=True)
@@ -169,6 +171,8 @@ class NotionConfig:
         self.hot_post_score_change_min = get_env_int('NOTION_HOT_POST_SCORE_CHANGE_MIN', self.hot_post_score_change_min)
         self.popular_post_comments_threshold = get_env_int('NOTION_POPULAR_POST_COMMENTS_THRESHOLD', self.popular_post_comments_threshold)
         self.popular_post_comments_change_min = get_env_int('NOTION_POPULAR_POST_COMMENTS_CHANGE_MIN', self.popular_post_comments_change_min)
+        self.report_parent_page_id = get_env_var('NOTION_REPORT_PARENT_PAGE_ID', self.report_parent_page_id)
+        self.kol_database_id = get_env_var('NOTION_KOL_DATABASE_ID', self.kol_database_id)
 
 @dataclass
 class EmailConfig:
@@ -198,19 +202,21 @@ class MonitoringConfig:
     check_interval: int = 300
     max_posts_per_subreddit: int = 25
     relevance_threshold: float = 0.3
-    
+    collector_type: str = 'json'  # 'json' or 'praw'
+
     def __post_init__(self):
-        self.target_subreddits = get_env_list('TARGET_SUBREDDITS', 
+        self.target_subreddits = get_env_list('TARGET_SUBREDDITS',
             ['homenetworking', 'networking', 'sysadmin', 'TPLINK'])
-        self.primary_keywords = get_env_list('PRIMARY_KEYWORDS', 
+        self.primary_keywords = get_env_list('PRIMARY_KEYWORDS',
             ['omada', 'tp-link', 'tplink', 'access point', 'archer', 'deco', 'eap'])
-        self.secondary_keywords = get_env_list('SECONDARY_KEYWORDS', 
+        self.secondary_keywords = get_env_list('SECONDARY_KEYWORDS',
             ['wifi', 'wireless', 'router', 'switch'])
-        self.competitor_keywords = get_env_list('COMPETITOR_KEYWORDS', 
+        self.competitor_keywords = get_env_list('COMPETITOR_KEYWORDS',
             ['ubiquiti', 'unifi', 'cisco', 'netgear'])
         self.check_interval = get_env_int('CHECK_INTERVAL', self.check_interval)
         self.max_posts_per_subreddit = get_env_int('MAX_POSTS_PER_SUBREDDIT', self.max_posts_per_subreddit)
         self.relevance_threshold = get_env_float('RELEVANCE_THRESHOLD', self.relevance_threshold)
+        self.collector_type = get_env_var('COLLECTOR_TYPE', self.collector_type)
 
 @dataclass
 class AlertConfig:
@@ -247,8 +253,28 @@ class SystemConfig:
         self.cache_ttl = get_env_int('CACHE_TTL', self.cache_ttl)
 
 @dataclass
+class AIFilterConfig:
+    """AI 批量过滤配置"""
+    provider: str = 'gemini'  # 'gemini' or 'openai'
+    api_key: str = ''
+    model: str = 'gemini-2.0-flash-lite'
+    base_url: str = ''  # for OpenAI-compatible providers
+    relevance_threshold: float = 0.4
+    batch_size: int = 15
+    db_path: str = 'data/omada_monitor.db'
+
+    def __post_init__(self):
+        self.provider = get_env_var('AI_FILTER_PROVIDER', self.provider)
+        self.api_key = get_env_var('AI_FILTER_API_KEY', self.api_key)
+        self.model = get_env_var('AI_FILTER_MODEL', self.model)
+        self.base_url = get_env_var('AI_FILTER_BASE_URL', self.base_url)
+        self.relevance_threshold = get_env_float('AI_FILTER_RELEVANCE_THRESHOLD', self.relevance_threshold)
+        self.batch_size = get_env_int('AI_FILTER_BATCH_SIZE', self.batch_size)
+        self.db_path = get_env_var('DB_PATH', self.db_path)
+
+@dataclass
 class AIAnalysisConfig:
-    """AI 分析配置"""
+    """AI 分析配置（旧版，保留兼容）"""
     analyzer_type: str = 'local'
     enabled: bool = True
     required: bool = False
@@ -259,7 +285,7 @@ class AIAnalysisConfig:
     notion_sentiment_column: str = 'AI情感分析'
     notion_summary_column: str = 'AI摘要'
     notion_keywords_column: str = 'AI关键词'
-    
+
     def __post_init__(self):
         self.analyzer_type = get_env_var('AI_ANALYZER_TYPE', self.analyzer_type)
         self.enabled = get_env_bool('AI_ANALYSIS_ENABLED', self.enabled)
@@ -282,12 +308,13 @@ monitoring_config: Optional[MonitoringConfig] = None
 alert_config: Optional[AlertConfig] = None
 system_config: Optional[SystemConfig] = None
 ai_analysis_config: Optional[AIAnalysisConfig] = None
+ai_filter_config: Optional[AIFilterConfig] = None
 
 def initialize_configs():
     """初始化所有配置"""
     global reddit_config, azure_config, openai_config, notion_config, email_config
-    global monitoring_config, alert_config, system_config, ai_analysis_config
-    
+    global monitoring_config, alert_config, system_config, ai_analysis_config, ai_filter_config
+
     try:
         reddit_config = RedditConfig()
         azure_config = AzureConfig()
@@ -298,6 +325,7 @@ def initialize_configs():
         alert_config = AlertConfig()
         system_config = SystemConfig()
         ai_analysis_config = AIAnalysisConfig()
+        ai_filter_config = AIFilterConfig()
         
         print("✅ 所有配置初始化完成")
         return True
@@ -334,7 +362,12 @@ SUBREDDIT_WEIGHTS = {
     'homenetworking': 1.2,
     'networking': 1.0,
     'sysadmin': 0.8,
-    'TPLINK': 1.5
+    'TPLINK': 1.5,
+    'Ubiquiti': 1.0,
+    'TPLink_Omada': 1.5,
+    'TplinkOmada': 1.5,
+    'msp': 0.8,
+    'Omada_Networks': 1.5,
 }
 
 def validate_config() -> bool:
