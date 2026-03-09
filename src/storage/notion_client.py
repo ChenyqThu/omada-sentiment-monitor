@@ -50,6 +50,14 @@ class NotionSyncClient(LoggerMixin):
         self.logger.info(f"Notion 客户端初始化完成")
         self.logger.info(f"Database ID: {self.database_id[:8]}...")
 
+    def health_check(self) -> Dict[str, Any]:
+        """检查 Notion 连通性"""
+        try:
+            self._get_database_schema()
+            return {"status": "healthy", "database_id": self.database_id[:8]}
+        except Exception as e:
+            return {"status": "unhealthy", "error": str(e)}
+
     # ------------------------------------------------------------------
     # Schema & property helpers
     # ------------------------------------------------------------------

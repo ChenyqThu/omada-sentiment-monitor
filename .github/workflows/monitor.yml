@@ -1,0 +1,70 @@
+name: Omada Sentiment Monitor
+
+on:
+  schedule:
+    # Every hour at minute 0
+    - cron: '0 * * * *'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore database cache
+        uses: actions/cache/restore@v4
+        with:
+          path: data/
+          key: omada-db-${{ github.run_id }}
+          restore-keys: |
+            omada-db-
+
+      - name: Ensure data directory exists
+        run: mkdir -p data
+
+      - name: Create .env from secrets
+        env:
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          NOTION_KOL_DATABASE_ID: ${{ secrets.NOTION_KOL_DATABASE_ID }}
+          AI_FILTER_API_KEY: ${{ secrets.AI_FILTER_API_KEY }}
+          AI_FILTER_PROVIDER: ${{ secrets.AI_FILTER_PROVIDER }}
+          AI_FILTER_MODEL: ${{ secrets.AI_FILTER_MODEL }}
+          TARGET_SUBREDDITS: ${{ secrets.TARGET_SUBREDDITS }}
+        run: |
+          cat > .env <<EOF
+          REDDIT_CLIENT_ID=${REDDIT_CLIENT_ID}
+          REDDIT_CLIENT_SECRET=${REDDIT_CLIENT_SECRET}
+          NOTION_TOKEN=${NOTION_TOKEN}
+          NOTION_DATABASE_ID=${NOTION_DATABASE_ID}
+          NOTION_KOL_DATABASE_ID=${NOTION_KOL_DATABASE_ID}
+          AI_FILTER_API_KEY=${AI_FILTER_API_KEY}
+          AI_FILTER_PROVIDER=${AI_FILTER_PROVIDER:-gemini}
+          AI_FILTER_MODEL=${AI_FILTER_MODEL:-gemini-2.0-flash-lite}
+          TARGET_SUBREDDITS=${TARGET_SUBREDDITS:-homenetworking,networking,sysadmin,TPLINK}
+          EOF
+
+      - name: Run pipeline
+        run: python src/main.py --stages scrape ai_filter comments kol notion_sync
+
+      - name: Save database cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: data/
+          key: omada-db-${{ github.run_id }}
