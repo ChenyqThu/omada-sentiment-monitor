@@ -38,7 +38,13 @@ CREATE TABLE IF NOT EXISTS posts (
 
     -- Notion sync tracking
     notion_page_id          TEXT,
-    notion_last_updated     TEXT
+    notion_last_updated     TEXT,
+
+    -- Hot post detection
+    prev_score              INTEGER,
+    prev_num_comments       INTEGER,
+    is_hot_post             INTEGER DEFAULT 0,
+    hot_post_detected_at    TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_posts_status ON posts(status);
@@ -122,7 +128,25 @@ class Database:
 
     def _init_schema(self):
         self.conn.executescript(SCHEMA_SQL)
+        self._migrate()
         logger.info(f"Database initialized: {self.db_path}")
+
+    def _migrate(self):
+        """Add columns that may be missing from older databases."""
+        cursor = self._conn.execute("PRAGMA table_info(posts)")
+        existing = {row[1] for row in cursor.fetchall()}
+
+        migrations = [
+            ("prev_score", "INTEGER"),
+            ("prev_num_comments", "INTEGER"),
+            ("is_hot_post", "INTEGER DEFAULT 0"),
+            ("hot_post_detected_at", "TEXT"),
+        ]
+        for col_name, col_type in migrations:
+            if col_name not in existing:
+                self._conn.execute(f"ALTER TABLE posts ADD COLUMN {col_name} {col_type}")
+                logger.info(f"Migrated: added column posts.{col_name}")
+        self._conn.commit()
 
     def close(self):
         if self._conn:

@@ -93,6 +93,8 @@ class NotionSyncClient(LoggerMixin):
                 return {'number': float(value) if value is not None else None}
             elif prop_type == 'select':
                 return {'select': {'name': str(value)} if value else None}
+            elif prop_type == 'status':
+                return {'status': {'name': str(value)} if value else None}
             elif prop_type == 'multi_select':
                 if isinstance(value, (list, tuple)):
                     return {'multi_select': [{'name': str(v)} for v in value if v]}
@@ -363,6 +365,7 @@ class NotionSyncClient(LoggerMixin):
         elif ai_relevance >= 0.5:
             priority = "中"
         property_mappings["优先级"] = priority
+        property_mappings["处理状态"] = "未处理"
 
         properties = {}
         for prop_name, value in property_mappings.items():
@@ -444,6 +447,59 @@ class NotionSyncClient(LoggerMixin):
             lines.append(f"")
             lines.append(f"{indent}</details>")
             lines.append("")
+
+    # ==================================================================
+    # Hot Post Update: update existing Notion pages for trending posts
+    # ==================================================================
+
+    def update_hot_post(self, post: dict) -> bool:
+        """Update a hot post's Notion page: refresh stats and reset 处理状态 to 未处理.
+
+        Args:
+            post: Post dict from SQLite (must have notion_page_id).
+
+        Returns:
+            True on success, False on failure.
+        """
+        page_id = post.get("notion_page_id")
+        if not page_id:
+            self.logger.warning(f"Hot post {post.get('id')} has no notion_page_id")
+            return False
+
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            now = _dt.now(_tz.utc)
+
+            prev_score = post.get("prev_score", 0) or 0
+            prev_comments = post.get("prev_num_comments", 0) or 0
+            new_score = post.get("score", 0) or 0
+            new_comments = post.get("num_comments", 0) or 0
+
+            properties = {
+                "分数": self._format_property_value("分数", new_score),
+                "评论数": self._format_property_value("评论数", new_comments),
+                "最后更新时间": self._format_property_value("最后更新时间", now),
+                "处理状态": self._format_property_value("处理状态", "未处理"),
+                "处理备注": self._format_property_value(
+                    "处理备注",
+                    f"增量热帖: 分数 {prev_score}→{new_score}, "
+                    f"评论 {prev_comments}→{new_comments}"
+                ),
+            }
+
+            # Remove None values
+            properties = {k: v for k, v in properties.items() if v is not None}
+
+            self.client.pages.update(page_id=page_id, properties=properties)
+            self.logger.info(
+                f"热帖更新: {post.get('id')} → {page_id} "
+                f"(分数 {prev_score}→{new_score}, 评论 {prev_comments}→{new_comments})"
+            )
+            return True
+
+        except Exception as e:
+            self.logger.error(f"热帖更新失败 [{post.get('id')}]: {e}")
+            return False
 
     # ==================================================================
     # KOL Sync: sync author dicts to Notion KOL database

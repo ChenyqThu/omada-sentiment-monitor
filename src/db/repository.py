@@ -48,11 +48,85 @@ class PostRepository:
         self.db.conn.commit()
         return inserted
 
-    def update_post_stats(self, post_id: str, score: int, num_comments: int) -> None:
-        """Update score/num_comments for already-seen posts."""
+    def update_post_stats(self, post_id: str, score: int, num_comments: int) -> bool:
+        """Update score/num_comments for already-seen posts.
+
+        Saves previous values for hot post detection.
+        Returns True if this post qualifies as a hot post (significant change).
+        """
+        row = self.db.conn.execute(
+            "SELECT score, num_comments FROM posts WHERE id=?", (post_id,)
+        ).fetchone()
+        if not row:
+            return False
+
+        old_score = row["score"] or 0
+        old_comments = row["num_comments"] or 0
+
+        is_hot = self._is_hot_post_change(old_score, score, old_comments, num_comments)
+
+        now = datetime.now(timezone.utc).isoformat()
+        if is_hot:
+            self.db.conn.execute(
+                """UPDATE posts SET
+                     prev_score=?, prev_num_comments=?,
+                     score=?, num_comments=?,
+                     is_hot_post=1, hot_post_detected_at=?
+                   WHERE id=?""",
+                (old_score, old_comments, score, num_comments, now, post_id),
+            )
+        else:
+            self.db.conn.execute(
+                """UPDATE posts SET
+                     prev_score=?, prev_num_comments=?,
+                     score=?, num_comments=?
+                   WHERE id=?""",
+                (old_score, old_comments, score, num_comments, post_id),
+            )
+        self.db.conn.commit()
+        return is_hot
+
+    @staticmethod
+    def _is_hot_post_change(
+        old_score: int, new_score: int,
+        old_comments: int, new_comments: int,
+    ) -> bool:
+        """Determine if a post has become a hot post based on score/comment changes.
+
+        Criteria (any one triggers):
+        - Score increase >= 50% AND absolute increase >= 10
+        - Comment increase >= 50% AND absolute increase >= 5
+        - Absolute score jump >= 50
+        - Absolute comment jump >= 20
+        """
+        score_diff = new_score - old_score
+        comment_diff = new_comments - old_comments
+
+        if score_diff >= 50 or comment_diff >= 20:
+            return True
+
+        if old_score > 0 and score_diff >= 10 and score_diff / old_score >= 0.5:
+            return True
+
+        if old_comments > 0 and comment_diff >= 5 and comment_diff / old_comments >= 0.5:
+            return True
+
+        return False
+
+    def get_hot_posts_for_notion_update(self) -> list[dict]:
+        """Get hot posts that already have Notion pages and need updating."""
+        rows = self.db.conn.execute(
+            """SELECT * FROM posts
+               WHERE is_hot_post = 1
+                 AND notion_page_id IS NOT NULL
+               ORDER BY hot_post_detected_at DESC""",
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def clear_hot_post_flag(self, post_id: str) -> None:
+        """Clear hot post flag after Notion update."""
         self.db.conn.execute(
-            "UPDATE posts SET score=?, num_comments=? WHERE id=?",
-            (score, num_comments, post_id),
+            "UPDATE posts SET is_hot_post=0 WHERE id=?", (post_id,)
         )
         self.db.conn.commit()
 

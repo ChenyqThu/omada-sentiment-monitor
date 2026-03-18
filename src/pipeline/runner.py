@@ -79,9 +79,14 @@ class PipelineRunner:
     # ------------------------------------------------------------------
 
     def run_stage_scrape(self) -> dict:
-        """Fetch all new posts from target subreddits into SQLite."""
+        """Fetch all new posts from target subreddits into SQLite.
+
+        Includes incremental hot post detection: compares current score/comments
+        against previous values and flags posts with significant changes.
+        """
         total_new = 0
         total_updated = 0
+        total_hot = 0
         errors = []
 
         for sub in self.subreddits:
@@ -98,22 +103,36 @@ class PipelineRunner:
                 new_count = self.repo.insert_posts(posts)
                 total_new += new_count
 
-                # Update stats for existing posts
+                # Update stats for existing posts + detect hot posts
+                sub_hot = 0
                 for p in posts:
-                    if new_count == 0 or True:  # always try update
-                        self.repo.update_post_stats(
-                            p["id"], p.get("score", 0), p.get("num_comments", 0)
+                    is_hot = self.repo.update_post_stats(
+                        p["id"], p.get("score", 0), p.get("num_comments", 0)
+                    )
+                    total_updated += 1
+                    if is_hot:
+                        sub_hot += 1
+                        total_hot += 1
+                        logger.info(
+                            f"  🔥 热帖检测: {p['id']} "
+                            f"(score={p.get('score', 0)}, comments={p.get('num_comments', 0)})"
                         )
-                        total_updated += 1
 
-                logger.info(f"  r/{sub}: {len(posts)} fetched, {new_count} new")
+                logger.info(
+                    f"  r/{sub}: {len(posts)} fetched, {new_count} new, {sub_hot} hot"
+                )
 
             except Exception as e:
                 logger.error(f"  r/{sub} scrape failed: {e}")
                 errors.append(f"r/{sub}: {e}")
 
         self.repo.log_pipeline_run("scrape", total_new + total_updated, total_new, errors)
-        result = {"new_posts": total_new, "updated": total_updated, "errors": errors}
+        result = {
+            "new_posts": total_new,
+            "updated": total_updated,
+            "hot_posts": total_hot,
+            "errors": errors,
+        }
         logger.info(f"Scrape complete: {result}")
         return result
 
@@ -325,37 +344,59 @@ class PipelineRunner:
     # ------------------------------------------------------------------
 
     def run_stage_notion_sync(self) -> dict:
-        """Sync filtered posts to Notion."""
+        """Sync filtered posts to Notion + update hot posts."""
         if not self.notion_client:
             logger.warning("Notion client not configured, skipping sync")
-            return {"synced": 0, "error": "no_notion_client"}
+            return {"synced": 0, "hot_updated": 0, "error": "no_notion_client"}
 
+        # --- Part 1: Sync new posts ---
         posts = self.repo.get_posts_for_notion_sync()
-        if not posts:
-            logger.info("No posts to sync to Notion")
-            return {"synced": 0}
-
-        logger.info(f"Syncing {len(posts)} posts to Notion ...")
         synced = 0
         errors = []
 
-        for p in posts:
-            try:
-                # Get post with comments for full content
-                full_post = self.repo.get_post_with_comments(p["id"])
-                if not full_post:
-                    continue
+        if posts:
+            logger.info(f"Syncing {len(posts)} new posts to Notion ...")
+            for p in posts:
+                try:
+                    full_post = self.repo.get_post_with_comments(p["id"])
+                    if not full_post:
+                        continue
 
-                page_id = self.notion_client.sync_post_from_dict(full_post)
-                if page_id:
-                    self.repo.mark_notion_synced(p["id"], page_id)
-                    synced += 1
-                    logger.debug(f"  Synced {p['id']} → {page_id}")
-            except Exception as e:
-                logger.warning(f"  Notion sync failed for {p['id']}: {e}")
-                errors.append(f"{p['id']}: {e}")
+                    page_id = self.notion_client.sync_post_from_dict(full_post)
+                    if page_id:
+                        self.repo.mark_notion_synced(p["id"], page_id)
+                        synced += 1
+                        logger.debug(f"  Synced {p['id']} → {page_id}")
+                except Exception as e:
+                    logger.warning(f"  Notion sync failed for {p['id']}: {e}")
+                    errors.append(f"{p['id']}: {e}")
+        else:
+            logger.info("No new posts to sync to Notion")
 
-        self.repo.log_pipeline_run("notion_sync", len(posts), synced, errors)
-        result = {"synced": synced, "total": len(posts), "errors": errors}
+        # --- Part 2: Update hot posts (reset 处理状态 to 未处理) ---
+        hot_posts = self.repo.get_hot_posts_for_notion_update()
+        hot_updated = 0
+
+        if hot_posts:
+            logger.info(f"Updating {len(hot_posts)} hot posts in Notion ...")
+            for p in hot_posts:
+                try:
+                    if self.notion_client.update_hot_post(p):
+                        self.repo.clear_hot_post_flag(p["id"])
+                        hot_updated += 1
+                except Exception as e:
+                    logger.warning(f"  Hot post update failed for {p['id']}: {e}")
+                    errors.append(f"hot:{p['id']}: {e}")
+        else:
+            logger.info("No hot posts to update in Notion")
+
+        self.repo.log_pipeline_run("notion_sync", len(posts) + len(hot_posts), synced + hot_updated, errors)
+        result = {
+            "synced": synced,
+            "total_new": len(posts),
+            "hot_updated": hot_updated,
+            "total_hot": len(hot_posts),
+            "errors": errors,
+        }
         logger.info(f"Notion sync complete: {result}")
         return result
