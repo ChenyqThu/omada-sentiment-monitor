@@ -8,9 +8,9 @@ from .providers import LLMProvider
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are a relevance filter for a Reddit monitoring system tracking the TP-Link Omada networking product line (enterprise/SMB access points, switches, gateways, SDN controllers) and related competitive landscape.
+SYSTEM_PROMPT = """You are a relevance filter for a social media monitoring system tracking the TP-Link Omada networking product line (enterprise/SMB access points, switches, gateways, SDN controllers) and related competitive landscape.
 
-Your job: Given a batch of Reddit posts (title + metadata), judge each post's relevance to Omada product monitoring. Consider:
+Your job: Given a batch of posts/videos (title + metadata) from Reddit or YouTube, judge each item's relevance to Omada product monitoring. Consider:
 
 RELEVANT topics (score 0.5-1.0):
 - Direct mentions of Omada, TP-Link networking products (EAP, SG, ER series, OC controllers), Omada SDN
@@ -41,11 +41,11 @@ For each post, return a JSON object with these fields:
 
 Return ONLY a JSON array. No markdown fences. No extra text."""
 
-USER_PROMPT_TEMPLATE = """Evaluate these {n} Reddit posts for Omada monitoring relevance:
+USER_PROMPT_TEMPLATE = """Evaluate these {n} items for Omada monitoring relevance:
 
 {posts_json}
 
-Return a JSON array with one object per post."""
+Return a JSON array with one object per item."""
 
 
 class AIBatchFilter:
@@ -62,17 +62,31 @@ class AIBatchFilter:
         self.batch_size = batch_size
 
     def _build_batch_payload(self, posts: list[dict]) -> str:
-        """Build compact JSON payload for a batch of posts."""
+        """Build compact JSON payload for a batch of posts/videos."""
         items = []
         for p in posts:
-            items.append({
-                "post_id": p["id"],
-                "subreddit": p.get("subreddit", ""),
-                "title": p.get("title", ""),
-                "selftext_preview": (p.get("selftext", "") or "")[:300],
-                "score": p.get("score", 0),
-                "num_comments": p.get("num_comments", 0),
-            })
+            source = p.get("source", "reddit")
+            if source == "youtube":
+                items.append({
+                    "post_id": p["id"],
+                    "source": "youtube",
+                    "channel": p.get("channel_title", ""),
+                    "title": p.get("title", ""),
+                    "description_preview": (p.get("description", "") or "")[:300],
+                    "view_count": p.get("view_count", 0),
+                    "like_count": p.get("like_count", 0),
+                    "comment_count": p.get("comment_count", 0),
+                })
+            else:
+                items.append({
+                    "post_id": p["id"],
+                    "source": "reddit",
+                    "subreddit": p.get("subreddit", ""),
+                    "title": p.get("title", ""),
+                    "selftext_preview": (p.get("selftext", "") or "")[:300],
+                    "score": p.get("score", 0),
+                    "num_comments": p.get("num_comments", 0),
+                })
         return json.dumps(items, ensure_ascii=False)
 
     def _parse_response(self, text: str, post_ids: set[str]) -> list[dict]:

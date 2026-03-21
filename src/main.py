@@ -16,7 +16,7 @@ if project_root not in sys.path:
 
 from config.settings import (
     initialize_configs, monitoring_config, notion_config,
-    ai_filter_config, system_config,
+    ai_filter_config, system_config, youtube_config,
 )
 
 logger = logging.getLogger("omada_pulse")
@@ -83,6 +83,28 @@ def build_pipeline(stages: list[str] = None):
         except Exception as e:
             logger.warning(f"Notion 客户端初始化失败: {e}")
 
+    # YouTube (optional)
+    yt_collector = None
+    yt_repo = None
+    needs_yt = stages is None or any(s.startswith("yt_") for s in (stages or []))
+    # YouTube is also needed for ai_filter, kol, notion_sync when enabled
+    if not needs_yt and stages:
+        needs_yt = bool({"ai_filter", "kol", "notion_sync"} & set(stages))
+
+    if youtube_config and youtube_config.enabled and youtube_config.api_key and needs_yt:
+        try:
+            from src.collectors.youtube_collector import YouTubeCollector
+            from src.db.youtube_repository import YouTubeRepository
+
+            yt_repo = YouTubeRepository(db)
+            yt_collector = YouTubeCollector(
+                api_key=youtube_config.api_key,
+                quota_tracker=yt_repo.track_quota,
+            )
+            logger.info("YouTube 采集器已初始化")
+        except Exception as e:
+            logger.warning(f"YouTube 初始化失败: {e}")
+
     # Pipeline runner
     runner = PipelineRunner(
         repo=repo,
@@ -92,6 +114,9 @@ def build_pipeline(stages: list[str] = None):
         subreddits=monitoring_config.target_subreddits,
         max_per_sub=monitoring_config.max_posts_per_subreddit,
         relevance_threshold=ai_filter_config.relevance_threshold,
+        youtube_collector=yt_collector,
+        youtube_repo=yt_repo,
+        youtube_config=youtube_config,
     )
 
     return runner, db
@@ -173,6 +198,42 @@ def show_stats():
         tier_str = ", ".join(f"{r['kol_tier']}: {r['cnt']}" for r in tiers)
         print(f"  KOL 等级分布: {tier_str}")
 
+    # YouTube stats
+    yt_tables = {row[0] for row in db.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    ).fetchall()}
+    if "youtube_videos" in yt_tables:
+        yt_count = db.conn.execute("SELECT COUNT(*) FROM youtube_videos").fetchone()[0]
+        yt_comment_count = db.conn.execute("SELECT COUNT(*) FROM youtube_comments").fetchone()[0]
+        yt_channel_count = db.conn.execute("SELECT COUNT(*) FROM youtube_channels").fetchone()[0]
+        yt_notion = db.conn.execute(
+            "SELECT COUNT(*) FROM youtube_videos WHERE notion_page_id IS NOT NULL"
+        ).fetchone()[0]
+        print(f"\n📺 YouTube 统计")
+        print(f"  视频: {yt_count}")
+        print(f"  评论: {yt_comment_count}")
+        print(f"  监控频道: {yt_channel_count}")
+        print(f"  Notion 已同步: {yt_notion}")
+
+        # YouTube status breakdown
+        yt_statuses = db.conn.execute(
+            "SELECT status, COUNT(*) as cnt FROM youtube_videos GROUP BY status"
+        ).fetchall()
+        if yt_statuses:
+            for r in yt_statuses:
+                print(f"  {r['status']}: {r['cnt']}")
+
+        # Quota
+        if "youtube_quota" in yt_tables:
+            from datetime import date
+            today = date.today().isoformat()
+            quota_row = db.conn.execute(
+                "SELECT * FROM youtube_quota WHERE date=?", (today,)
+            ).fetchone()
+            if quota_row:
+                print(f"\n  今日配额: {quota_row['units_used']} 单位 "
+                      f"(搜索: {quota_row['search_units']}, 其他: {quota_row['other_units']})")
+
     # Recent pipeline runs
     rows = db.conn.execute(
         "SELECT * FROM pipeline_runs ORDER BY id DESC LIMIT 10"
@@ -221,7 +282,8 @@ def main():
     )
     parser.add_argument(
         "--stages", nargs="+",
-        choices=["scrape", "ai_filter", "comments", "kol", "notion_sync"],
+        choices=["scrape", "yt_scrape", "ai_filter", "comments",
+                 "yt_comments", "kol", "notion_sync"],
         default=None, help="指定运行的阶段（默认: 全部）",
     )
     parser.add_argument("--stats", action="store_true", help="显示数据库统计")
@@ -249,6 +311,12 @@ def main():
             if runner.notion_client:
                 nh = runner.notion_client.health_check()
                 print(f"Notion: {nh.get('status', 'unknown')}")
+            if runner.yt_collector:
+                yh = runner.yt_collector.health_check()
+                print(f"YouTube: {yh.get('status', 'unknown')}")
+                if runner.yt_repo:
+                    quota = runner.yt_repo.get_quota_details()
+                    print(f"YouTube 配额: {quota.get('units_used', 0)}/{youtube_config.daily_quota_limit}")
         finally:
             db.close()
         sys.exit(0)

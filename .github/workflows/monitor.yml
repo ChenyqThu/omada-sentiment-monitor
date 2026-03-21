@@ -46,6 +46,11 @@ jobs:
           AI_FILTER_PROVIDER: ${{ secrets.AI_FILTER_PROVIDER }}
           AI_FILTER_MODEL: ${{ secrets.AI_FILTER_MODEL }}
           TARGET_SUBREDDITS: ${{ secrets.TARGET_SUBREDDITS }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          YOUTUBE_ENABLED: ${{ secrets.YOUTUBE_ENABLED }}
+          YOUTUBE_SEARCH_KEYWORDS: ${{ secrets.YOUTUBE_SEARCH_KEYWORDS }}
+          YOUTUBE_MONITORED_CHANNELS: ${{ secrets.YOUTUBE_MONITORED_CHANNELS }}
+          NOTION_YOUTUBE_DATABASE_ID: ${{ secrets.NOTION_YOUTUBE_DATABASE_ID }}
         run: |
           cat > .env <<EOF
           REDDIT_CLIENT_ID=${REDDIT_CLIENT_ID}
@@ -57,10 +62,15 @@ jobs:
           AI_FILTER_PROVIDER=${AI_FILTER_PROVIDER:-gemini}
           AI_FILTER_MODEL=${AI_FILTER_MODEL:-gemini-2.0-flash-lite}
           TARGET_SUBREDDITS=${TARGET_SUBREDDITS:-homenetworking,networking,sysadmin,TPLINK}
+          YOUTUBE_API_KEY=${YOUTUBE_API_KEY}
+          YOUTUBE_ENABLED=${YOUTUBE_ENABLED:-false}
+          YOUTUBE_SEARCH_KEYWORDS=${YOUTUBE_SEARCH_KEYWORDS:-TP-Link Omada,Omada SDN,Omada EAP,Omada,Unifi,Ubiquiti}
+          YOUTUBE_MONITORED_CHANNELS=${YOUTUBE_MONITORED_CHANNELS:-@UbiquitiInc,@UniFi-Academy,@SPXLabs,@WillieHowe,@CrosstalkSolutions,@landpet}
+          NOTION_YOUTUBE_DATABASE_ID=${NOTION_YOUTUBE_DATABASE_ID}
           EOF
 
       - name: Run pipeline
-        run: python src/main.py --stages scrape ai_filter comments kol notion_sync
+        run: python src/main.py --stages scrape yt_scrape ai_filter comments yt_comments kol notion_sync
 
       - name: Save database cache
         uses: actions/cache/save@v4

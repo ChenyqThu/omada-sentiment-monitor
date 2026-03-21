@@ -16,7 +16,7 @@ def clear_and_load_env():
         'TARGET_', 'PRIMARY_', 'SECONDARY_', 'COMPETITOR_', 'CHECK_',
         'MAX_', 'RELEVANCE_', 'ALERTS_', 'CRITICAL_', 'HIGH_',
         'INFLUENCE_', 'NEGATIVE_', 'LOG_', 'DEBUG_', 'TEST_',
-        'DATA_', 'CACHE_', 'AI_', 'ENABLE_'
+        'DATA_', 'CACHE_', 'AI_', 'ENABLE_', 'YOUTUBE_'
     ]
     
     # 清理现有环境变量
@@ -104,6 +104,7 @@ class NotionConfig:
     required: bool = False
     
     kol_database_id: str = ''
+    youtube_database_id: str = ''
 
     def __post_init__(self):
         self.token = get_env_var('NOTION_TOKEN', required=True)
@@ -114,6 +115,7 @@ class NotionConfig:
         self.enabled = bool(self.token and self.database_id)
         self.required = get_env_bool('NOTION_REQUIRED', self.required)
         self.kol_database_id = get_env_var('NOTION_KOL_DATABASE_ID', self.kol_database_id)
+        self.youtube_database_id = get_env_var('NOTION_YOUTUBE_DATABASE_ID', self.youtube_database_id)
 
 @dataclass
 class EmailConfig:
@@ -192,6 +194,38 @@ class AIFilterConfig:
         self.batch_size = get_env_int('AI_FILTER_BATCH_SIZE', self.batch_size)
         self.db_path = get_env_var('DB_PATH', self.db_path)
 
+@dataclass
+class YouTubeConfig:
+    """YouTube Data API v3 配置"""
+    api_key: str = ''
+    enabled: bool = False
+    search_keywords: List[str] = None
+    search_interval_hours: int = 4
+    max_search_results: int = 10
+    monitored_channels: List[str] = None
+    daily_quota_limit: int = 10000
+    hot_view_jump: int = 5000
+    hot_like_jump: int = 200
+    hot_comment_jump: int = 50
+
+    def __post_init__(self):
+        self.api_key = get_env_var('YOUTUBE_API_KEY', self.api_key)
+        self.enabled = get_env_bool('YOUTUBE_ENABLED', self.enabled)
+        self.search_keywords = get_env_list(
+            'YOUTUBE_SEARCH_KEYWORDS',
+            ['TP-Link Omada', 'Omada SDN', 'Omada EAP', 'Omada', 'Unifi', 'Ubiquiti'],
+        )
+        self.search_interval_hours = get_env_int('YOUTUBE_SEARCH_INTERVAL_HOURS', self.search_interval_hours)
+        self.max_search_results = get_env_int('YOUTUBE_MAX_SEARCH_RESULTS', self.max_search_results)
+        self.monitored_channels = get_env_list(
+            'YOUTUBE_MONITORED_CHANNELS',
+            ['@UbiquitiInc', '@UniFi-Academy', '@SPXLabs', '@WillieHowe', '@CrosstalkSolutions', '@landpet'],
+        )
+        self.daily_quota_limit = get_env_int('YOUTUBE_DAILY_QUOTA_LIMIT', self.daily_quota_limit)
+        self.hot_view_jump = get_env_int('YOUTUBE_HOT_VIEW_JUMP', self.hot_view_jump)
+        self.hot_like_jump = get_env_int('YOUTUBE_HOT_LIKE_JUMP', self.hot_like_jump)
+        self.hot_comment_jump = get_env_int('YOUTUBE_HOT_COMMENT_JUMP', self.hot_comment_jump)
+
 # 全局配置实例 - 延迟初始化
 reddit_config: Optional[RedditConfig] = None
 notion_config: Optional[NotionConfig] = None
@@ -199,11 +233,13 @@ email_config: Optional[EmailConfig] = None
 monitoring_config: Optional[MonitoringConfig] = None
 system_config: Optional[SystemConfig] = None
 ai_filter_config: Optional[AIFilterConfig] = None
+youtube_config: Optional[YouTubeConfig] = None
 
 def initialize_configs():
     """初始化所有配置"""
     global reddit_config, notion_config, email_config
     global monitoring_config, system_config, ai_filter_config
+    global youtube_config
 
     try:
         reddit_config = RedditConfig()
@@ -212,8 +248,12 @@ def initialize_configs():
         monitoring_config = MonitoringConfig()
         system_config = SystemConfig()
         ai_filter_config = AIFilterConfig()
+        youtube_config = YouTubeConfig()
 
         print("✅ 所有配置初始化完成")
+        if youtube_config.enabled:
+            print(f"  📺 YouTube 监控已启用 ({len(youtube_config.search_keywords)} 关键词, "
+                  f"{len(youtube_config.monitored_channels)} 频道)")
         return True
     except Exception as e:
         print(f"❌ 配置初始化失败: {e}")

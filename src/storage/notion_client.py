@@ -759,3 +759,422 @@ class NotionSyncClient(LoggerMixin):
             lines.append("")
 
         return "\n".join(lines)
+
+    # ==================================================================
+    # YouTube Video Sync
+    # ==================================================================
+
+    def sync_youtube_video_from_dict(self, video: dict) -> Optional[str]:
+        """Sync a YouTube video dict (from SQLite with comments) to Notion YouTube DB.
+
+        Returns the Notion page ID on success, None on failure.
+        """
+        if not notion_config.youtube_database_id:
+            self.logger.warning("NOTION_YOUTUBE_DATABASE_ID 未配置，跳过 YouTube 同步")
+            return None
+
+        video_id = video.get("id", "")
+        if not video_id:
+            self.logger.error("Video dict missing 'id'")
+            return None
+
+        try:
+            existing = self._find_existing_youtube_page(video_id)
+            properties = self._build_youtube_properties(video)
+
+            if existing:
+                page_id = existing["id"]
+                self.client.pages.update(page_id=page_id, properties=properties)
+
+                old_comments = self._get_yt_page_comment_count(existing)
+                new_comments = len(video.get("comments", []))
+                if new_comments != old_comments:
+                    markdown = self._build_youtube_page_content(video)
+                    if markdown:
+                        self._replace_page_markdown(page_id, markdown)
+                    self.logger.info(f"更新 YouTube 页面 (含内容): {page_id}")
+                else:
+                    self.logger.info(f"更新 YouTube 页面 (仅属性): {page_id}")
+            else:
+                response = self.client.pages.create(
+                    parent={"database_id": notion_config.youtube_database_id},
+                    properties=properties,
+                )
+                page_id = response["id"]
+                self.logger.info(f"创建 YouTube 页面: {page_id}")
+
+                markdown = self._build_youtube_page_content(video)
+                if markdown:
+                    self._write_page_markdown(page_id, markdown)
+
+            return page_id
+
+        except Exception as e:
+            self.logger.error(f"sync_youtube_video_from_dict 失败 [{video_id}]: {e}")
+            return None
+
+    def _find_existing_youtube_page(self, video_id: str) -> Optional[Dict[str, Any]]:
+        """查找是否已存在相同 Video ID 的页面"""
+        try:
+            response = self.client.databases.query(
+                database_id=notion_config.youtube_database_id,
+                filter={
+                    "property": "Video ID",
+                    "rich_text": {"equals": video_id},
+                },
+                page_size=1,
+            )
+            results = response.get("results", [])
+            return results[0] if results else None
+        except Exception as e:
+            self.logger.warning(f"查找 YouTube 页面失败: {e}")
+            return None
+
+    def _get_yt_page_comment_count(self, page: dict) -> int:
+        """Extract comment count from an existing YouTube Notion page."""
+        props = page.get("properties", {})
+        num_prop = props.get("评论数", {})
+        return num_prop.get("number", 0) or 0
+
+    def _build_youtube_properties(self, video: dict) -> Dict[str, Any]:
+        """Build Notion properties for a YouTube video page."""
+        from datetime import datetime as _dt, timezone as _tz
+
+        now = _dt.now(_tz.utc)
+        week_str = now.strftime("%G-W%V")
+
+        sentiment_map = {
+            "positive": "正面", "negative": "负面",
+            "neutral": "中性", "mixed": "混合",
+        }
+        topic_map = {
+            "product_issue": "技术问题", "feature_request": "功能需求",
+            "deployment": "部署案例", "comparison": "竞品对比",
+            "recommendation_ask": "产品推荐", "firmware_update": "固件更新",
+            "general_discussion": "一般讨论", "competitor_intel": "竞品情报",
+            "positive_feedback": "正面反馈", "negative_feedback": "负面反馈",
+            "not_relevant": "低相关",
+        }
+
+        ai_sentiment = video.get("ai_sentiment_quick", "neutral")
+        ai_topic = video.get("ai_topic_category", "")
+        ai_relevance = video.get("ai_relevance_score", 0.0) or 0.0
+
+        sentiment_score_map = {
+            "positive": 0.6, "negative": -0.6,
+            "neutral": 0.0, "mixed": 0.0,
+        }
+
+        discovered_map = {
+            "search": "关键词搜索",
+            "channel_monitor": "频道监控",
+        }
+
+        property_mappings = {
+            "标题": video.get("title", ""),
+            "描述": (video.get("description", "") or "")[:500],
+            "来源": "YouTube",
+            "类型": "Video",
+            "Video ID": video["id"],
+            "频道名": video.get("channel_title", ""),
+            "频道 ID": video.get("channel_id", ""),
+            "播放量": video.get("view_count", 0),
+            "点赞数": video.get("like_count", 0),
+            "评论数": video.get("comment_count", 0),
+            "时长": video.get("duration", ""),
+            "发布时间": video.get("published_at", ""),
+            "采集时间": now,
+            "最后更新时间": now,
+            "视频链接": video.get("url", f"https://www.youtube.com/watch?v={video['id']}"),
+            "缩略图": video.get("thumbnail_url", ""),
+            "相关性得分": ai_relevance,
+            "周报周期": week_str,
+            "情感倾向": sentiment_map.get(ai_sentiment, "中性"),
+            "情感分数_数值": sentiment_score_map.get(ai_sentiment, 0.0),
+            "AI摘要": video.get("ai_brief_reason", ""),
+            "发现来源": discovered_map.get(video.get("discovered_via", "search"), "关键词搜索"),
+            "处理状态": "未处理",
+        }
+
+        if ai_topic and ai_topic != "not_relevant":
+            property_mappings["主题分类"] = topic_map.get(ai_topic, ai_topic)
+
+        # Alert level (YouTube thresholds are higher than Reddit)
+        view_count = video.get("view_count", 0) or 0
+        comment_count = video.get("comment_count", 0) or 0
+        alert_level = "none"
+        if ai_sentiment == "negative" and (view_count > 10000 or comment_count > 50):
+            alert_level = "critical"
+        elif ai_sentiment == "negative" and (view_count > 1000 or comment_count > 20):
+            alert_level = "high"
+        elif ai_sentiment == "negative":
+            alert_level = "medium"
+        property_mappings["预警等级"] = alert_level
+
+        # Priority
+        priority = "低"
+        if ai_relevance >= 0.8 and (view_count > 5000 or comment_count > 30):
+            priority = "高"
+        elif ai_relevance >= 0.5:
+            priority = "中"
+        property_mappings["优先级"] = priority
+
+        # Temporarily switch schema cache to YouTube DB
+        old_schema = self._database_schema
+        self._database_schema = None
+        old_db_id = self.database_id
+
+        try:
+            self.database_id = notion_config.youtube_database_id
+            properties = {}
+            for prop_name, value in property_mappings.items():
+                formatted = self._format_property_value(prop_name, value)
+                if formatted is not None:
+                    properties[prop_name] = formatted
+        finally:
+            self._database_schema = old_schema
+            self.database_id = old_db_id
+
+        return properties
+
+    def _build_youtube_page_content(self, video: dict) -> str:
+        """Build markdown content for a YouTube video page."""
+        lines = []
+
+        lines.append("## 📺 视频信息")
+        lines.append("")
+        lines.append(f"频道: [{video.get('channel_title', '')}](https://www.youtube.com/channel/{video.get('channel_id', '')})")
+        lines.append("")
+
+        published = video.get("published_at", "")
+        if published:
+            lines.append(f"发布时间: {published[:19].replace('T', ' ')} UTC")
+        lines.append("")
+
+        view_count = video.get("view_count", 0)
+        like_count = video.get("like_count", 0)
+        comment_count = video.get("comment_count", 0)
+        duration = video.get("duration", "")
+        lines.append(f"播放量: {view_count:,} | 点赞: {like_count:,} | 评论: {comment_count:,} | 时长: {duration}")
+        lines.append("")
+
+        ai_reason = video.get("ai_brief_reason", "")
+        ai_topic = video.get("ai_topic_category", "")
+        ai_sentiment = video.get("ai_sentiment_quick", "")
+        ai_relevance = video.get("ai_relevance_score", 0)
+        if ai_reason:
+            lines.append(f"**AI 初筛**: {ai_reason} (相关性: {ai_relevance:.2f}, 话题: {ai_topic}, 情感: {ai_sentiment})")
+            lines.append("")
+
+        lines.append("## 📝 视频描述")
+        lines.append("")
+        description = video.get("description", "") or ""
+        if description.strip():
+            lines.append(description.strip())
+        else:
+            lines.append("（无描述）")
+        lines.append("")
+
+        comments = video.get("comments", [])
+        if comments:
+            lines.append(f"## 💬 评论 ({len(comments)} 条)")
+            lines.append("")
+            for c in comments:
+                author = c.get("author", "")
+                like_c = c.get("like_count", 0)
+                text = (c.get("text", "") or "").strip()
+                is_reply = c.get("is_reply", False)
+                indent = "\t" if is_reply else ""
+
+                lines.append(f"{indent}<details>")
+                lines.append(f"{indent}<summary>💬 {author} (👍 {like_c})</summary>")
+                lines.append("")
+                if text:
+                    for bline in text.split("\n"):
+                        lines.append(f"{indent}\t{bline}")
+                else:
+                    lines.append(f"{indent}\t（空评论）")
+                lines.append("")
+                lines.append(f"{indent}</details>")
+                lines.append("")
+
+        return "\n".join(lines)
+
+    def update_hot_youtube_video(self, video: dict) -> bool:
+        """Update a hot video's Notion page: refresh stats and reset 处理状态."""
+        page_id = video.get("notion_page_id")
+        if not page_id:
+            self.logger.warning(f"Hot video {video.get('id')} has no notion_page_id")
+            return False
+
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            now = _dt.now(_tz.utc)
+
+            prev_views = video.get("prev_view_count", 0) or 0
+            prev_likes = video.get("prev_like_count", 0) or 0
+            prev_comments = video.get("prev_comment_count", 0) or 0
+            new_views = video.get("view_count", 0) or 0
+            new_likes = video.get("like_count", 0) or 0
+            new_comments = video.get("comment_count", 0) or 0
+
+            old_schema = self._database_schema
+            self._database_schema = None
+            old_db_id = self.database_id
+
+            try:
+                self.database_id = notion_config.youtube_database_id
+                properties = {
+                    "播放量": self._format_property_value("播放量", new_views),
+                    "点赞数": self._format_property_value("点赞数", new_likes),
+                    "评论数": self._format_property_value("评论数", new_comments),
+                    "最后更新时间": self._format_property_value("最后更新时间", now),
+                    "处理状态": self._format_property_value("处理状态", "未处理"),
+                    "处理备注": self._format_property_value(
+                        "处理备注",
+                        f"热视频: 播放 {prev_views:,}→{new_views:,}, "
+                        f"点赞 {prev_likes}→{new_likes}, "
+                        f"评论 {prev_comments}→{new_comments}"
+                    ),
+                }
+            finally:
+                self._database_schema = old_schema
+                self.database_id = old_db_id
+
+            properties = {k: v for k, v in properties.items() if v is not None}
+
+            self.client.pages.update(page_id=page_id, properties=properties)
+            self.logger.info(
+                f"热视频更新: {video.get('id')} → {page_id} "
+                f"(播放 {prev_views:,}→{new_views:,})"
+            )
+            return True
+
+        except Exception as e:
+            self.logger.error(f"热视频更新失败 [{video.get('id')}]: {e}")
+            return False
+
+    # ==================================================================
+    # YouTube KOL Sync (channels → KOL database)
+    # ==================================================================
+
+    def sync_youtube_kol_from_dict(self, channel: dict, videos: list[dict] = None) -> Optional[str]:
+        """Sync a YouTube channel to Notion KOL database.
+
+        Returns the Notion page ID on success, None on failure.
+        """
+        if not notion_config.kol_database_id:
+            self.logger.warning("NOTION_KOL_DATABASE_ID 未配置，跳过 YouTube KOL 同步")
+            return None
+
+        channel_title = channel.get("title", "")
+        if not channel_title:
+            return None
+
+        try:
+            existing = self._find_kol_page(channel_title)
+            properties = self._build_youtube_kol_properties(channel, videos)
+
+            if existing:
+                page_id = existing["id"]
+                self.client.pages.update(page_id=page_id, properties=properties)
+                self.logger.info(f"更新 YouTube KOL 页面: {channel_title} → {page_id}")
+            else:
+                response = self.client.pages.create(
+                    parent={"database_id": notion_config.kol_database_id},
+                    properties=properties,
+                )
+                page_id = response["id"]
+                self.logger.info(f"创建 YouTube KOL 页面: {channel_title} → {page_id}")
+
+                markdown = self._build_youtube_kol_markdown(channel, videos)
+                if markdown:
+                    self._write_page_markdown(page_id, markdown)
+
+            return page_id
+
+        except Exception as e:
+            self.logger.error(f"sync_youtube_kol_from_dict 失败 [{channel_title}]: {e}")
+            return None
+
+    def _build_youtube_kol_properties(self, channel: dict, videos: list[dict] = None) -> Dict[str, Any]:
+        """Build Notion properties for a YouTube KOL page."""
+        channel_title = channel.get("title", "")
+        subscriber_count = channel.get("subscriber_count", 0)
+        video_count = channel.get("video_count", 0)
+        total_views = channel.get("view_count", 0)
+        kol_score = channel.get("kol_score", 0)
+        kol_tier = channel.get("kol_tier", "watch")
+
+        tier_cn = {
+            "expert": "专家", "insider": "内行",
+            "active": "活跃", "watch": "观察",
+        }
+
+        properties = {
+            "KOL 名称": {
+                "title": [{"text": {"content": channel_title}}]
+            },
+            "粉丝数量": {"number": subscriber_count},
+            "互动率": {"number": round(kol_score, 2)},
+            "平台": {
+                "multi_select": [{"name": "YouTube"}]
+            },
+            "主页": {"email": f"https://www.youtube.com/channel/{channel.get('id', '')}"},
+            "备注": {
+                "rich_text": [{
+                    "text": {
+                        "content": (
+                            f"KOL等级: {tier_cn.get(kol_tier, kol_tier)} "
+                            f"(评分: {kol_score:.1f}) | "
+                            f"订阅: {subscriber_count:,} | "
+                            f"视频: {video_count} | "
+                            f"总播放: {total_views:,}"
+                        )[:2000]
+                    }
+                }]
+            },
+            "领域": {"multi_select": [{"name": "网络设备"}]},
+        }
+
+        return properties
+
+    def _build_youtube_kol_markdown(self, channel: dict, videos: list[dict] = None) -> str:
+        """Build markdown content for a YouTube KOL page."""
+        lines = []
+        title = channel.get("title", "")
+        channel_id = channel.get("id", "")
+
+        lines.append("## 📺 频道概况")
+        lines.append("")
+        lines.append(f"**YouTube**: [{title}](https://www.youtube.com/channel/{channel_id})")
+        lines.append("")
+
+        lines.append("| 指标 | 值 |")
+        lines.append("|---|---|")
+        lines.append(f"| 订阅数 | {channel.get('subscriber_count', 0):,} |")
+        lines.append(f"| 视频数 | {channel.get('video_count', 0):,} |")
+        lines.append(f"| 总播放量 | {channel.get('view_count', 0):,} |")
+        lines.append("")
+
+        kol_score = channel.get("kol_score", 0)
+        kol_tier = channel.get("kol_tier", "watch")
+        tier_cn = {"expert": "专家", "insider": "内行", "active": "活跃", "watch": "观察"}
+        lines.append("## 📊 KOL 评估")
+        lines.append("")
+        lines.append(f"**评分**: {kol_score:.1f}  |  **等级**: {tier_cn.get(kol_tier, kol_tier)}")
+        lines.append("")
+
+        if videos:
+            lines.append(f"## 📝 相关视频 ({len(videos)} 个)")
+            lines.append("")
+            for v in videos[:20]:
+                vtitle = v.get("title", "")
+                views = v.get("view_count", 0)
+                likes = v.get("like_count", 0)
+                vid = v.get("id", "")
+                link = f"https://www.youtube.com/watch?v={vid}"
+                lines.append(f"- [{vtitle}]({link}) | 👁️{views:,} 👍{likes:,}")
+            lines.append("")
+
+        return "\n".join(lines)
