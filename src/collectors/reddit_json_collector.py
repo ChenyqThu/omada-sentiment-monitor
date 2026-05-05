@@ -1,6 +1,7 @@
 """
 Reddit JSON Collector
-Fetches Reddit data using the public .json endpoint via httpx (no PRAW dependency).
+Fetches Reddit data using OAuth when credentials are configured, with a
+public .json fallback for local unauthenticated use.
 """
 import time
 import os
@@ -21,6 +22,7 @@ _DEFAULT_USER_AGENT = "OmadaPulseMonitor/2.0"
 
 # Reddit base URL
 _REDDIT_BASE = "https://www.reddit.com"
+_REDDIT_OAUTH_BASE = "https://oauth.reddit.com"
 
 # Retry settings
 _MAX_RETRIES = 3
@@ -28,7 +30,7 @@ _BACKOFF_BASE = 2.0  # seconds
 
 
 class RedditJsonCollector(LoggerMixin):
-    """Reddit data collector using the public .json endpoint via httpx."""
+    """Reddit data collector using OAuth or the public .json endpoint."""
 
     def __init__(self, config: Optional[dict] = None):
         """
@@ -38,12 +40,18 @@ class RedditJsonCollector(LoggerMixin):
             config: Optional dict with keys:
                 - user_agent (str): override default user-agent
                 - timeout (float): HTTP timeout in seconds (default 30)
+                - client_id (str): Reddit app client ID for OAuth
+                - client_secret (str): Reddit app client secret for OAuth
         """
         if config is None:
             config = {}
 
         self._user_agent = config.get("user_agent", _DEFAULT_USER_AGENT)
         self._timeout = config.get("timeout", 30.0)
+        self._client_id = config.get("client_id", "")
+        self._client_secret = config.get("client_secret", "")
+        self._oauth_token: Optional[str] = None
+        self._oauth_expires_at = 0.0
 
         # httpx client with persistent headers and redirect following
         self._client = httpx.Client(
@@ -60,7 +68,8 @@ class RedditJsonCollector(LoggerMixin):
         self._rate_limit_reset: Optional[float] = None  # seconds until window reset
 
         self.logger.info(
-            f"RedditJsonCollector initialised with user-agent: {self._user_agent}"
+            f"RedditJsonCollector initialised with user-agent: {self._user_agent} "
+            f"({'oauth' if self._oauth_configured else 'anonymous'} mode)"
         )
 
     # ------------------------------------------------------------------
@@ -72,16 +81,16 @@ class RedditJsonCollector(LoggerMixin):
     ) -> list[dict]:
         """Fetch latest posts from a subreddit.
 
-        GET /r/{subreddit}/{sort}.json?limit={limit}
+        GET /r/{subreddit}/{sort}?limit={limit}
 
         Returns:
             List of parsed post dicts.
         """
-        url = f"{_REDDIT_BASE}/r/{subreddit}/{sort}.json"
+        url, authenticated = self._api_url(f"/r/{subreddit}/{sort}")
         params = {"limit": limit}
 
         try:
-            response = self._get(url, params=params)
+            response = self._get(url, params=params, authenticated=authenticated)
         except Exception as exc:
             self.logger.error(
                 f"fetch_subreddit_posts failed for r/{subreddit}: {exc}"
@@ -110,16 +119,16 @@ class RedditJsonCollector(LoggerMixin):
     ) -> dict:
         """Fetch a single post with all comments.
 
-        GET /comments/{post_id}/.json?limit=100&depth=10
+        GET /comments/{post_id}?limit=100&depth=10
 
         Returns:
             {"post": {...}, "comments": [...]}
         """
-        url = f"{_REDDIT_BASE}/comments/{post_id}/.json"
+        url, authenticated = self._api_url(f"/comments/{post_id}")
         params = {"limit": 100, "depth": 10}
 
         try:
-            response = self._get(url, params=params)
+            response = self._get(url, params=params, authenticated=authenticated)
         except Exception as exc:
             self.logger.error(
                 f"fetch_post_with_comments failed for {post_id}: {exc}"
@@ -161,7 +170,7 @@ class RedditJsonCollector(LoggerMixin):
             return {"post": {}, "comments": [], "more_comment_ids": []}
 
     def fetch_user_profile(self, username: str) -> Optional[dict]:
-        """Fetch a Reddit user's public profile via /user/{name}/about.json.
+        """Fetch a Reddit user's public profile via /user/{name}/about.
 
         Returns a dict with: username, total_karma, link_karma, comment_karma,
         created_utc, account_age_days, is_gold, is_mod, has_verified_email.
@@ -170,9 +179,9 @@ class RedditJsonCollector(LoggerMixin):
         if not username or username == "[deleted]":
             return None
 
-        url = f"{_REDDIT_BASE}/user/{username}/about.json"
+        url, authenticated = self._api_url(f"/user/{username}/about")
         try:
-            response = self._get(url)
+            response = self._get(url, authenticated=authenticated)
             data = response.json().get("data", {})
             if not data.get("name"):
                 return None
@@ -199,19 +208,19 @@ class RedditJsonCollector(LoggerMixin):
     def health_check(self) -> dict:
         """Check if Reddit is accessible.
 
-        GET /r/all/new.json?limit=1
+        GET /r/all/new?limit=1
 
         Returns:
             {"status": "healthy"|"unhealthy", ...}
         """
-        url = f"{_REDDIT_BASE}/r/all/new.json"
+        url, authenticated = self._api_url("/r/all/new")
         try:
-            response = self._get(url, params={"limit": 1})
+            response = self._get(url, params={"limit": 1}, authenticated=authenticated)
             data = response.json()
             children = data.get("data", {}).get("children", [])
             return {
                 "status": "healthy",
-                "reddit_json_api": "accessible",
+                "reddit_api": "oauth" if authenticated else "public_json",
                 "sample_posts_returned": len(children),
                 "rate_limit_remaining": self._rate_limit_remaining,
             }
@@ -224,6 +233,40 @@ class RedditJsonCollector(LoggerMixin):
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    @property
+    def _oauth_configured(self) -> bool:
+        """Whether Reddit OAuth credentials are available."""
+        return bool(self._client_id and self._client_secret)
+
+    def _api_url(self, path: str) -> tuple[str, bool]:
+        """Return the Reddit API URL and whether it needs OAuth auth."""
+        if self._oauth_configured:
+            return f"{_REDDIT_OAUTH_BASE}{path}", True
+        return f"{_REDDIT_BASE}{path}.json", False
+
+    def _get_oauth_token(self) -> str:
+        """Fetch and cache an app-only Reddit OAuth access token."""
+        now = time.time()
+        if self._oauth_token and now < self._oauth_expires_at:
+            return self._oauth_token
+
+        response = self._client.post(
+            f"{_REDDIT_BASE}/api/v1/access_token",
+            auth=(self._client_id, self._client_secret),
+            data={"grant_type": "client_credentials"},
+            headers={"User-Agent": self._user_agent},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        token = payload.get("access_token")
+        if not token:
+            raise ValueError("Reddit OAuth response did not include access_token")
+
+        expires_in = int(payload.get("expires_in", 3600))
+        self._oauth_token = token
+        self._oauth_expires_at = now + max(expires_in - 60, 60)
+        return token
 
     def _handle_rate_limit(self, response: httpx.Response) -> None:
         """Read rate-limit headers and sleep if remaining < 10."""
@@ -258,22 +301,37 @@ class RedditJsonCollector(LoggerMixin):
         url: str,
         params: Optional[dict] = None,
         attempt: int = 0,
+        authenticated: bool = False,
     ) -> httpx.Response:
         """Perform a GET with retries and rate-limit handling."""
         try:
-            response = self._client.get(url, params=params)
+            headers = None
+            if authenticated:
+                headers = {"Authorization": f"Bearer {self._get_oauth_token()}"}
+            response = self._client.get(url, params=params, headers=headers)
             self._handle_rate_limit(response)
             response.raise_for_status()
             return response
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
+            if status == 401 and authenticated and attempt < _MAX_RETRIES:
+                self._oauth_token = None
+                self._oauth_expires_at = 0.0
+                self.logger.warning("Reddit OAuth token rejected. Refreshing token.")
+                return self._get(
+                    url, params=params, attempt=attempt + 1,
+                    authenticated=authenticated,
+                )
             if status == 429 and attempt < _MAX_RETRIES:
                 wait = _BACKOFF_BASE ** attempt * 2
                 self.logger.warning(
                     f"HTTP 429 on {url}. Retry {attempt+1}/{_MAX_RETRIES} in {wait}s"
                 )
                 time.sleep(wait)
-                return self._get(url, params=params, attempt=attempt + 1)
+                return self._get(
+                    url, params=params, attempt=attempt + 1,
+                    authenticated=authenticated,
+                )
             raise
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
             if attempt < _MAX_RETRIES:
@@ -283,7 +341,10 @@ class RedditJsonCollector(LoggerMixin):
                     f"Retry {attempt+1}/{_MAX_RETRIES} in {wait}s"
                 )
                 time.sleep(wait)
-                return self._get(url, params=params, attempt=attempt + 1)
+                return self._get(
+                    url, params=params, attempt=attempt + 1,
+                    authenticated=authenticated,
+                )
             raise
 
     def _parse_post(self, post_data: dict) -> dict:

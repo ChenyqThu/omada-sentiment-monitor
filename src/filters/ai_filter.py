@@ -151,7 +151,10 @@ class AIBatchFilter:
             results = self._parse_response(response, post_ids)
         except Exception as e:
             logger.error(f"AI filter batch failed: {e}")
-            return []
+            raise
+
+        if not results:
+            raise ValueError("AI filter returned no parseable results for a non-empty batch")
 
         # Fill in missing post IDs with default (not_relevant)
         seen = {r["post_id"] for r in results}

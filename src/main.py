@@ -15,7 +15,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from config.settings import (
-    initialize_configs, monitoring_config, notion_config,
+    initialize_configs, monitoring_config, notion_config, reddit_config,
     ai_filter_config, system_config, youtube_config,
 )
 
@@ -46,7 +46,13 @@ def build_pipeline(stages: list[str] = None):
     repo = PostRepository(db)
 
     # Reddit collector
-    collector = RedditJsonCollector()
+    collector = RedditJsonCollector(
+        config={
+            "user_agent": reddit_config.user_agent,
+            "client_id": reddit_config.client_id,
+            "client_secret": reddit_config.client_secret,
+        }
+    )
 
     # AI filter — only init provider if needed
     needs_ai = stages is None or "ai_filter" in stages
