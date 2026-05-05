@@ -314,11 +314,12 @@ class PipelineRunner:
 
         if posts:
             logger.info(f"AI filtering {len(posts)} Reddit posts ...")
-            results = self.ai_filter.filter_all(posts)
-            filtered, rejected = self.repo.update_ai_filter_results(
-                results, threshold=self.relevance_threshold
+            processed, filtered, rejected = self._filter_and_persist_batches(
+                posts,
+                label="Reddit",
+                update_results=self.repo.update_ai_filter_results,
             )
-            total_processed += len(posts)
+            total_processed += processed
             total_filtered += filtered
             total_rejected += rejected
 
@@ -330,11 +331,12 @@ class PipelineRunner:
                 # Add source marker for payload builder
                 for v in yt_videos:
                     v["source"] = "youtube"
-                yt_results = self.ai_filter.filter_all(yt_videos)
-                yt_filtered, yt_rejected = self.yt_repo.update_ai_filter_results(
-                    yt_results, threshold=self.relevance_threshold
+                yt_processed, yt_filtered, yt_rejected = self._filter_and_persist_batches(
+                    yt_videos,
+                    label="YouTube",
+                    update_results=self.yt_repo.update_ai_filter_results,
                 )
-                total_processed += len(yt_videos)
+                total_processed += yt_processed
                 total_filtered += yt_filtered
                 total_rejected += yt_rejected
                 logger.info(f"  YouTube: {yt_filtered} passed, {yt_rejected} rejected")
@@ -347,6 +349,42 @@ class PipelineRunner:
         result = {"processed": total_processed, "filtered": total_filtered, "rejected": total_rejected}
         logger.info(f"AI filter complete: {result}")
         return result
+
+    def _filter_and_persist_batches(
+        self,
+        items: list[dict],
+        label: str,
+        update_results,
+    ) -> tuple[int, int, int]:
+        """Filter items and persist each completed batch immediately."""
+        total = len(items)
+        processed = 0
+        filtered = 0
+        rejected = 0
+        batch_size = self.ai_filter.batch_size
+        total_batches = (total + batch_size - 1) // batch_size
+
+        for i in range(0, total, batch_size):
+            batch = items[i:i + batch_size]
+            batch_num = i // batch_size + 1
+            logger.info(
+                f"AI filter {label} batch {batch_num}/{total_batches} "
+                f"({len(batch)} items)"
+            )
+            results = self.ai_filter.filter_batch(batch)
+            batch_filtered, batch_rejected = update_results(
+                results, threshold=self.relevance_threshold
+            )
+
+            processed += len(batch)
+            filtered += batch_filtered
+            rejected += batch_rejected
+            logger.info(
+                f"  {label}: {batch_filtered}/{len(batch)} passed threshold "
+                f"({self.relevance_threshold}); batch persisted"
+            )
+
+        return processed, filtered, rejected
 
     # ------------------------------------------------------------------
     # Stage 3: Comment Fetch
