@@ -2,11 +2,15 @@
 import json
 import logging
 import re
+import time
 from typing import Optional
 
 from .providers import LLMProvider
 
 logger = logging.getLogger(__name__)
+
+BATCH_MAX_ATTEMPTS = 3
+BATCH_RETRY_BACKOFF_SECONDS = 2.0
 
 SYSTEM_PROMPT = """You are a relevance filter for a social media monitoring system tracking the TP-Link Omada networking product line (enterprise/SMB access points, switches, gateways, SDN controllers) and related competitive landscape.
 
@@ -138,7 +142,12 @@ class AIBatchFilter:
         return valid
 
     def filter_batch(self, posts: list[dict]) -> list[dict]:
-        """Send one batch to LLM, parse response, return results."""
+        """Send one batch to LLM, parse response, return results.
+
+        Retries up to BATCH_MAX_ATTEMPTS on provider error or unparseable
+        response — LLMs occasionally return malformed JSON or transient
+        failures and a fresh attempt usually clears it.
+        """
         if not posts:
             return []
 
@@ -146,15 +155,38 @@ class AIBatchFilter:
         user_prompt = USER_PROMPT_TEMPLATE.format(n=len(posts), posts_json=payload)
         post_ids = {p["id"] for p in posts}
 
-        try:
-            response = self.provider.complete(SYSTEM_PROMPT, user_prompt)
-            results = self._parse_response(response, post_ids)
-        except Exception as e:
-            logger.error(f"AI filter batch failed: {e}")
-            raise
+        results: list[dict] = []
+        last_error: Optional[Exception] = None
+        for attempt in range(1, BATCH_MAX_ATTEMPTS + 1):
+            try:
+                response = self.provider.complete(SYSTEM_PROMPT, user_prompt)
+                results = self._parse_response(response, post_ids)
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"AI filter batch attempt {attempt}/{BATCH_MAX_ATTEMPTS} "
+                    f"failed: {e}"
+                )
+                results = []
+            else:
+                if results:
+                    break
+                last_error = ValueError(
+                    "AI filter returned no parseable results for a non-empty batch"
+                )
+                logger.warning(
+                    f"AI filter batch attempt {attempt}/{BATCH_MAX_ATTEMPTS} "
+                    f"returned no parseable results"
+                )
+
+            if attempt < BATCH_MAX_ATTEMPTS:
+                time.sleep(BATCH_RETRY_BACKOFF_SECONDS * attempt)
 
         if not results:
-            raise ValueError("AI filter returned no parseable results for a non-empty batch")
+            assert last_error is not None
+            raise last_error if isinstance(last_error, ValueError) else ValueError(
+                f"AI filter batch failed after {BATCH_MAX_ATTEMPTS} attempts: {last_error}"
+            )
 
         # Fill in missing post IDs with default (not_relevant)
         seen = {r["post_id"] for r in results}

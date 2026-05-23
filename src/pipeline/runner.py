@@ -311,10 +311,12 @@ class PipelineRunner:
         total_processed = 0
         total_filtered = 0
         total_rejected = 0
+        total_skipped = 0
+        failed_batches: list[str] = []
 
         if posts:
             logger.info(f"AI filtering {len(posts)} Reddit posts ...")
-            processed, filtered, rejected = self._filter_and_persist_batches(
+            processed, filtered, rejected, skipped, errors = self._filter_and_persist_batches(
                 posts,
                 label="Reddit",
                 update_results=self.repo.update_ai_filter_results,
@@ -322,6 +324,8 @@ class PipelineRunner:
             total_processed += processed
             total_filtered += filtered
             total_rejected += rejected
+            total_skipped += skipped
+            failed_batches.extend(errors)
 
         # --- YouTube videos ---
         if self.yt_repo:
@@ -331,22 +335,40 @@ class PipelineRunner:
                 # Add source marker for payload builder
                 for v in yt_videos:
                     v["source"] = "youtube"
-                yt_processed, yt_filtered, yt_rejected = self._filter_and_persist_batches(
-                    yt_videos,
-                    label="YouTube",
-                    update_results=self.yt_repo.update_ai_filter_results,
+                yt_processed, yt_filtered, yt_rejected, yt_skipped, yt_errors = (
+                    self._filter_and_persist_batches(
+                        yt_videos,
+                        label="YouTube",
+                        update_results=self.yt_repo.update_ai_filter_results,
+                    )
                 )
                 total_processed += yt_processed
                 total_filtered += yt_filtered
                 total_rejected += yt_rejected
+                total_skipped += yt_skipped
+                failed_batches.extend(yt_errors)
                 logger.info(f"  YouTube: {yt_filtered} passed, {yt_rejected} rejected")
 
         self.repo.log_pipeline_run(
             "ai_filter", total_processed, total_filtered,
             model=self.ai_filter.provider.model_name if self.ai_filter else None,
+            errors=failed_batches or None,
         )
 
-        result = {"processed": total_processed, "filtered": total_filtered, "rejected": total_rejected}
+        result = {
+            "processed": total_processed,
+            "filtered": total_filtered,
+            "rejected": total_rejected,
+        }
+        # Skipped batches stay in `scraped` status; next cron picks them up.
+        if total_skipped:
+            result["skipped_items"] = total_skipped
+            result["failed_batches"] = len(failed_batches)
+            logger.warning(
+                f"AI filter: {total_skipped} items skipped across "
+                f"{len(failed_batches)} unrecoverable batches; "
+                f"will retry next run"
+            )
         logger.info(f"AI filter complete: {result}")
         return result
 
@@ -355,12 +377,23 @@ class PipelineRunner:
         items: list[dict],
         label: str,
         update_results,
-    ) -> tuple[int, int, int]:
-        """Filter items and persist each completed batch immediately."""
+    ) -> tuple[int, int, int, int, list[str]]:
+        """Filter items and persist each completed batch immediately.
+
+        Returns (processed, filtered, rejected, skipped, error_messages).
+        A batch that fails after all retries inside ``ai_filter.filter_batch``
+        is logged and skipped — its items remain in ``scraped`` status so the
+        next cron run will pick them up. We deliberately do not raise here;
+        a single bad batch should not abort the whole pipeline (and trip the
+        workflow's exit code), which would also block downstream stages
+        (comments, kol, notion_sync) that have nothing to do with the LLM.
+        """
         total = len(items)
         processed = 0
         filtered = 0
         rejected = 0
+        skipped = 0
+        errors: list[str] = []
         batch_size = self.ai_filter.batch_size
         total_batches = (total + batch_size - 1) // batch_size
 
@@ -371,7 +404,19 @@ class PipelineRunner:
                 f"AI filter {label} batch {batch_num}/{total_batches} "
                 f"({len(batch)} items)"
             )
-            results = self.ai_filter.filter_batch(batch)
+            try:
+                results = self.ai_filter.filter_batch(batch)
+            except Exception as e:
+                skipped += len(batch)
+                msg = f"{label} batch {batch_num}/{total_batches}: {e}"
+                errors.append(msg)
+                logger.error(
+                    f"AI filter {label} batch {batch_num}/{total_batches} "
+                    f"failed after retries, skipping {len(batch)} items "
+                    f"(will retry next run): {e}"
+                )
+                continue
+
             batch_filtered, batch_rejected = update_results(
                 results, threshold=self.relevance_threshold
             )
@@ -384,7 +429,7 @@ class PipelineRunner:
                 f"({self.relevance_threshold}); batch persisted"
             )
 
-        return processed, filtered, rejected
+        return processed, filtered, rejected, skipped, errors
 
     # ------------------------------------------------------------------
     # Stage 3: Comment Fetch
