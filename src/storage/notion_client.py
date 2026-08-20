@@ -255,6 +255,12 @@ class NotionSyncClient(LoggerMixin):
 
             if existing:
                 page_id = existing["id"]
+                # 「处理状态」只在建页时给初始值。它是纯人工字段，代码永远写死
+                # 「未处理」，重新同步不带任何新信息 —— 而重新同步是会发生的
+                # （CI 缓存过期后 DB 重建，帖子会从 scraped 重走一遍全流程），
+                # 那时不该把人工标记冲回「未处理」。热帖的主动重置是另一条路径
+                # （update_hot_post），不受这里影响。
+                properties.pop("处理状态", None)
                 self.client.pages.update(page_id=page_id, properties=properties)
 
                 # Check if comments changed — if so, replace page content
@@ -784,6 +790,7 @@ class NotionSyncClient(LoggerMixin):
 
             if existing:
                 page_id = existing["id"]
+                properties.pop("处理状态", None)  # 同 sync_post_from_dict：不覆盖人工标记
                 self.client.pages.update(page_id=page_id, properties=properties)
 
                 old_comments = self._get_yt_page_comment_count(existing)
