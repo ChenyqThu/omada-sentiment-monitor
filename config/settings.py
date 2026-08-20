@@ -177,12 +177,14 @@ class SystemConfig:
 @dataclass
 class AIFilterConfig:
     """AI 批量过滤配置"""
-    provider: str = 'gemini'  # 'gemini' or 'openai'
+    provider: str = 'gemini'  # 'gemini', 'openai', or 'anthropic'
     api_key: str = ''
     model: str = 'gemini-2.0-flash-lite'
     base_url: str = ''  # for OpenAI-compatible providers
     relevance_threshold: float = 0.4
     batch_size: int = 15
+    time_budget_seconds: int = 1200  # 单轮 AI 过滤的墙钟上限，防止跑爆 workflow 超时
+    max_consecutive_failures: int = 3  # 连续失败这么多批就判定供应商不可用，跳过剩余
     db_path: str = 'data/omada_monitor.db'
 
     def __post_init__(self):
@@ -192,6 +194,8 @@ class AIFilterConfig:
         self.base_url = get_env_var('AI_FILTER_BASE_URL', self.base_url)
         self.relevance_threshold = get_env_float('AI_FILTER_RELEVANCE_THRESHOLD', self.relevance_threshold)
         self.batch_size = get_env_int('AI_FILTER_BATCH_SIZE', self.batch_size)
+        self.time_budget_seconds = get_env_int('AI_FILTER_TIME_BUDGET_SECONDS', self.time_budget_seconds)
+        self.max_consecutive_failures = get_env_int('AI_FILTER_MAX_CONSECUTIVE_FAILURES', self.max_consecutive_failures)
         self.db_path = get_env_var('DB_PATH', self.db_path)
 
 @dataclass

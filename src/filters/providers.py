@@ -81,3 +81,38 @@ class OpenAICompatibleProvider(LLMProvider):
             max_tokens=8192,
         )
         return response.choices[0].message.content
+
+
+class AnthropicProvider(LLMProvider):
+    """Anthropic Messages API provider. Supports custom base_url for relays."""
+
+    def __init__(self, api_key: str, model: str, base_url: str = None):
+        try:
+            import anthropic
+        except ImportError:
+            raise ImportError("anthropic package required: pip install anthropic")
+        self._model = model
+        kwargs = {"api_key": api_key, "timeout": 120.0}
+        if base_url:
+            # The SDK appends `/v1/messages` itself. Relays publish their
+            # endpoint as `.../v1`, and the OpenAI-compatible provider does
+            # want that suffix — so accept either form here and strip it.
+            kwargs["base_url"] = base_url.rstrip("/").removesuffix("/v1")
+        self._client = anthropic.Anthropic(**kwargs)
+
+    @property
+    def model_name(self) -> str:
+        return self._model
+
+    def complete(self, system_prompt: str, user_prompt: str) -> str:
+        # No `temperature`: sampling params are rejected with a 400 on Sonnet 5
+        # and the rest of the 4.6+ family. Thinking is disabled because this is
+        # a fixed-schema classification, not a reasoning task.
+        response = self._client.messages.create(
+            model=self._model,
+            max_tokens=8192,
+            system=system_prompt,
+            thinking={"type": "disabled"},
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        return "".join(b.text for b in response.content if b.type == "text")

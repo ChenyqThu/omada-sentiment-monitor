@@ -64,6 +64,13 @@ def build_pipeline(stages: list[str] = None):
                 api_key=ai_filter_config.api_key,
                 model=ai_filter_config.model,
             )
+        elif ai_filter_config.provider == "anthropic":
+            from src.filters.providers import AnthropicProvider
+            provider = AnthropicProvider(
+                api_key=ai_filter_config.api_key,
+                model=ai_filter_config.model,
+                base_url=ai_filter_config.base_url or None,
+            )
         else:
             from src.filters.providers import OpenAICompatibleProvider
             provider = OpenAICompatibleProvider(
@@ -123,6 +130,8 @@ def build_pipeline(stages: list[str] = None):
         youtube_collector=yt_collector,
         youtube_repo=yt_repo,
         youtube_config=youtube_config,
+        ai_time_budget_seconds=ai_filter_config.time_budget_seconds,
+        ai_max_consecutive_failures=ai_filter_config.max_consecutive_failures,
     )
 
     return runner, db

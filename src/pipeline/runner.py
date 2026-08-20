@@ -1,5 +1,7 @@
 """Multi-source pipeline orchestrator: scrape → AI filter → comment fetch → Notion sync."""
 import logging
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 
 from src.collectors.reddit_json_collector import RedditJsonCollector
@@ -7,6 +9,40 @@ from src.db.repository import PostRepository
 from src.filters.ai_filter import AIBatchFilter
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _AIFilterBudget:
+    """Per-run limits for the AI filter stage, shared across Reddit and YouTube.
+
+    A large backlog is worked off across successive cron runs rather than in one
+    go: whichever limit trips first ends the stage, and the untouched items stay
+    in ``scraped`` status for the next run. Without this a backlog (or a dead
+    provider retried batch after batch) runs past the workflow's timeout and the
+    job is cancelled, which also loses the downstream stages.
+    """
+
+    deadline: float  # time.monotonic() value past which no new batch starts
+    max_consecutive_failures: int
+    consecutive_failures: int = 0
+    stop_reason: str = ""
+
+    def should_stop(self) -> str:
+        """Return a non-empty reason once the stage must stop starting batches."""
+        if not self.stop_reason and time.monotonic() >= self.deadline:
+            self.stop_reason = "time budget exhausted"
+        return self.stop_reason
+
+    def record_failure(self) -> None:
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= self.max_consecutive_failures:
+            self.stop_reason = (
+                f"{self.consecutive_failures} consecutive batch failures — "
+                "provider looks unavailable"
+            )
+
+    def record_success(self) -> None:
+        self.consecutive_failures = 0
 
 
 class PipelineRunner:
@@ -24,6 +60,8 @@ class PipelineRunner:
         youtube_collector=None,
         youtube_repo=None,
         youtube_config=None,
+        ai_time_budget_seconds: int = 1200,
+        ai_max_consecutive_failures: int = 3,
     ):
         self.repo = repo
         self.collector = collector
@@ -35,6 +73,8 @@ class PipelineRunner:
         self.yt_collector = youtube_collector
         self.yt_repo = youtube_repo
         self.yt_config = youtube_config
+        self.ai_time_budget_seconds = ai_time_budget_seconds
+        self.ai_max_consecutive_failures = ai_max_consecutive_failures
 
     def run(self, stages: list[str] = None) -> dict:
         """Execute pipeline stages. Default: all stages in order.
@@ -306,6 +346,11 @@ class PipelineRunner:
             logger.warning("AI filter not configured (missing API key), skipping")
             return {"processed": 0, "filtered": 0, "rejected": 0, "skipped": "no_api_key"}
 
+        budget = _AIFilterBudget(
+            deadline=time.monotonic() + self.ai_time_budget_seconds,
+            max_consecutive_failures=self.ai_max_consecutive_failures,
+        )
+
         # --- Reddit posts ---
         posts = self.repo.get_posts_by_status("scraped")
         total_processed = 0
@@ -315,11 +360,15 @@ class PipelineRunner:
         failed_batches: list[str] = []
 
         if posts:
-            logger.info(f"AI filtering {len(posts)} Reddit posts ...")
+            logger.info(
+                f"AI filtering {len(posts)} Reddit posts "
+                f"(budget {self.ai_time_budget_seconds}s) ..."
+            )
             processed, filtered, rejected, skipped, errors = self._filter_and_persist_batches(
                 posts,
                 label="Reddit",
                 update_results=self.repo.update_ai_filter_results,
+                budget=budget,
             )
             total_processed += processed
             total_filtered += filtered
@@ -340,6 +389,7 @@ class PipelineRunner:
                         yt_videos,
                         label="YouTube",
                         update_results=self.yt_repo.update_ai_filter_results,
+                        budget=budget,
                     )
                 )
                 total_processed += yt_processed
@@ -364,6 +414,8 @@ class PipelineRunner:
         if total_skipped:
             result["skipped_items"] = total_skipped
             result["failed_batches"] = len(failed_batches)
+            if budget.stop_reason:
+                result["stopped_early"] = budget.stop_reason
             logger.warning(
                 f"AI filter: {total_skipped} items skipped across "
                 f"{len(failed_batches)} unrecoverable batches; "
@@ -377,6 +429,7 @@ class PipelineRunner:
         items: list[dict],
         label: str,
         update_results,
+        budget: _AIFilterBudget,
     ) -> tuple[int, int, int, int, list[str]]:
         """Filter items and persist each completed batch immediately.
 
@@ -387,6 +440,10 @@ class PipelineRunner:
         a single bad batch should not abort the whole pipeline (and trip the
         workflow's exit code), which would also block downstream stages
         (comments, kol, notion_sync) that have nothing to do with the LLM.
+
+        ``budget`` stops the loop once the stage runs out of time or the
+        provider fails often enough to look down; the remaining items are
+        counted as skipped and left queued.
         """
         total = len(items)
         processed = 0
@@ -398,6 +455,17 @@ class PipelineRunner:
         total_batches = (total + batch_size - 1) // batch_size
 
         for i in range(0, total, batch_size):
+            stop_reason = budget.should_stop()
+            if stop_reason:
+                remaining = total - i
+                skipped += remaining
+                logger.warning(
+                    f"AI filter {label}: stopping at batch {i // batch_size + 1}"
+                    f"/{total_batches} ({stop_reason}); {remaining} items stay "
+                    f"queued for the next run"
+                )
+                break
+
             batch = items[i:i + batch_size]
             batch_num = i // batch_size + 1
             logger.info(
@@ -410,6 +478,7 @@ class PipelineRunner:
                 skipped += len(batch)
                 msg = f"{label} batch {batch_num}/{total_batches}: {e}"
                 errors.append(msg)
+                budget.record_failure()
                 logger.error(
                     f"AI filter {label} batch {batch_num}/{total_batches} "
                     f"failed after retries, skipping {len(batch)} items "
@@ -417,6 +486,7 @@ class PipelineRunner:
                 )
                 continue
 
+            budget.record_success()
             batch_filtered, batch_rejected = update_results(
                 results, threshold=self.relevance_threshold
             )
